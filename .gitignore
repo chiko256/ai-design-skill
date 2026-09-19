@@ -6,6 +6,8 @@ __MACOSX/
 .env.*
 !.env.example
 node_modules/
+__pycache__/
+*.py[cod]
 private-bundle/
 data/
 *.pem
