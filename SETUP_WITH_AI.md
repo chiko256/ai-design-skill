@@ -29,7 +29,10 @@
 
 ```text
 ~/.codex/skills/web-design-pro/SKILL.md
+~/.codex/skills/web-design-pro/.git
 ```
+
+`scripts/update-client.sh`を一度実行し、自動更新の確認結果が`current`または`updated`になることを確認する。許可画面が表示された場合は、GitHubからの更新確認に必要な操作だと利用者へ案内する。
 
 ## 2. MCP接続設定を追加する
 
@@ -82,8 +85,8 @@ Figmaへのログイン、アカウント選択、アクセス許可は利用者
 
 > AIデザインで、〇〇のTOPページを作りたいです。
 
-## GitHubからの更新
+## GitHubからの自動更新
 
-利用者から更新を依頼された場合は、インストール先のGit状態と未保存変更を確認する。問題がなければ、現在のブランチをGitHubの最新版へfast-forwardで更新する。
+AIデザインSkillは、制作開始時にGitHubの最新版を確認し、更新があればfast-forwardで反映する。利用者へ更新操作を求めない。
 
-更新後、`VERSION`、`SKILL.md`、`codex-config.example.toml`を確認する。接続設定の変更がある場合だけ既存設定へ反映し、Codexを再起動して契約・バージョン確認を行う。
+ローカル変更、GitHub以外の接続先、履歴の分岐を検出した場合は上書きしない。更新後は`SKILL.md`を読み直す。接続設定の変更がある場合だけ既存設定へ反映し、必要な場合のみCodexの再起動を案内する。
