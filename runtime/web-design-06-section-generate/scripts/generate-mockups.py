@@ -23,34 +23,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageStat
-
-REQUESTED_IMAGE_WIDTH = 2880
-ALLOWED_TARGET_RATIOS = {
-    "short": {"3:1", "5:2"},
-    "standard": {"16:9", "3:2"},
-    "tall": {"4:3", "1:1"},
-}
-ALLOWED_HEIGHT_TYPES = {*ALLOWED_TARGET_RATIOS, "custom"}
-TARGET_RATIO_TOLERANCE = 0.01
-EDGE_BAND_RATIO = 0.01
-EDGE_BAND_MIN_PX = 4
-EDGE_BAND_MAX_PX = 32
-EDGE_BAND_MAX_STDDEV = 18.0
-EDGE_BAND_MAX_MEAN_DELTA = 24.0
+REQUIRED_IMAGE_WIDTH = 1440
 REQUIRED_PROMPT_META_KEYS = {
     "target_sections",
     "source_text_exact",
     "section_purpose",
     "background_zone",
     "display_text_exact",
+    "special_direction",
+    "fv_expression",
     "expected_output_file",
 }
-OPTIONAL_PROMPT_META_KEYS = {
-    "combine_sections_explicit", "target_ratio",
-    "decoration_level", "special_direction",
-}
-LEGACY_PROMPT_META_KEYS = {"background", "top_background", "bottom_background", "height_type", "text_scale_profile"}
+OPTIONAL_PROMPT_META_KEYS = {"combine_sections_explicit", "text_scale_profile"}
+LEGACY_PROMPT_META_KEYS = {"background", "top_background", "bottom_background"}
 ALLOWED_PROMPT_META_KEYS = (
     REQUIRED_PROMPT_META_KEYS | OPTIONAL_PROMPT_META_KEYS | LEGACY_PROMPT_META_KEYS
 )
@@ -60,21 +45,29 @@ ALLOWED_CONTENT_SURFACE_POLICIES = {
     "code-friendly-standard",
     "texture-asset-explicit",
 }
-ALLOWED_DECORATION_LEVELS = {
-    "あしらい",
-    "あしらい少し",
-    "なし",
+DEFAULT_TEXT_SCALE_PROFILE = "default-web"
+ALLOWED_TEXT_SCALE_PROFILES = {
+    "default-web",
+    "news-compact",
+    "voice-reading",
+    "faq-compact",
 }
-DECORATION_PROMPT_LINES = {
-    "あしらい": "- あしらい: TOPの雰囲気に合うあしらいを、セクションの見せ場になる十分な存在感で使用する。",
-    "あしらい少し": "- あしらい: TOPの雰囲気に合うあしらいを控えめに使用する。箇所数は固定しない。",
-    "なし": "- あしらい: このセクションには背景のあしらいを入れない。内容を説明する人物・UI・イラストは使用してよい。",
+TEXT_SCALE_PROMPT_LINES = {
+    "default-web": (),
+    "news-compact": (
+        "- 1440px幅のPC表示換算で、日付14px、カテゴリ14px、補足・概要文14px、お知らせ見出し16pxにする。",
+        "- お知らせの件数が少なくても、余白を埋める目的で文字、行間、各項目を拡大しない。",
+    ),
+    "voice-reading": (
+        "- 1440px幅のPC表示換算で、短い引用・カード見出し20px、本文16px、氏名14px、年代・属性13pxにする。",
+        "- 声の件数が少なくても、余白を埋める目的で引用、本文、行間、各項目を拡大しない。",
+    ),
+    "faq-compact": (
+        "- 1440px幅のPC表示換算で、質問18px、回答16px、Aラベル18px、Qラベル22pxにする。",
+        "- 質問を大見出しや大きなカード見出しにせず、質問と回答をコンパクトな縦リストとして整理する。",
+        "- 質問数が少なくても、余白を埋める目的で文字、行間、各FAQ行を拡大しない。",
+    ),
 }
-TYPOGRAPHY_PROMPT_LINES = (
-    "- 同じ役割の文字の大きさ・階層感をページ全体で揃える。数字・短い英語・飾り文字は内容上必要な時だけ強調してよい。",
-    "- 通常のPC版Webサイトとして構成し、ポスターやプレゼン資料のような巨大文字にしない。",
-    "- 余白を埋める目的で文字、行間、反復項目を拡大しない。",
-)
 STANDARD_CONTENT_SURFACE_PROHIBITION = (
     "カードやパネルに、紙・布・水彩の表面テクスチャ、破れた縁、"
     "要素ごとに異なる不規則な輪郭を使用しない。"
@@ -113,9 +106,7 @@ NO_PHOTO_DIRECTION_PHRASES = (
     "イラストのみ",
     "イラストだけ",
 )
-SIZE_POLICY_KEYS = {"layout_viewport_px", "content_width_px"}
-LEGACY_FONT_SIZE_KEYS = {"h2_japanese_px", "h2_japanese_max_px"}
-ALLOWED_PAGE_COMMON_META_KEYS = SIZE_POLICY_KEYS | LEGACY_FONT_SIZE_KEYS | {
+ALLOWED_PAGE_COMMON_META_KEYS = {
     "background_palette",
     "background_zones",
     "content_surface_policy",
@@ -147,77 +138,30 @@ def png_dimensions(path: Path) -> tuple[int, int]:
     return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
 
 
-def find_requested_width_mismatches(paths: list[Path]) -> list[str]:
-    """希望幅と異なるPNGを、原寸を変更せずに報告する。"""
-    issues: list[str] = []
-    for path in paths:
-        width, height = png_dimensions(path)
-        if width <= 0 or height <= 0:
-            fail(f"画像寸法が不正です: {path} ({width}x{height})")
-        if width != REQUESTED_IMAGE_WIDTH:
-            issues.append(
-                f"{path}: 希望幅 {REQUESTED_IMAGE_WIDTH}px / 実寸 {width}x{height}"
-            )
-    return issues
-
-
-def parse_target_ratio(value: object, num: int | None = None) -> tuple[str, float]:
-    """`横:縦` の目標比率を正規化し、数値比率を返す。"""
-    label = f"プロンプト{num}: " if num is not None else ""
-    ratio = str(value).strip()
-    match = re.fullmatch(r"([1-9]\d*(?:\.\d+)?)\s*:\s*([1-9]\d*(?:\.\d+)?)", ratio)
-    if not match:
-        fail(f"{label}target_ratio は `横:縦` で指定してください: {ratio}")
-    width = float(match.group(1))
-    height = float(match.group(2))
-    return f"{match.group(1)}:{match.group(2)}", width / height
-
-
-def validate_height_meta(meta: dict, num: int) -> None:
-    """比率は指定時だけ検証し、旧入力の高さタイプも受け取る。"""
-    if "target_ratio" not in meta:
-        if "height_type" in meta:
-            fail(f"プロンプト{num}: height_type 単独の指定は使わず、高さ・比率未指定なら両方を省略してください")
+def normalize_png_width(path: Path, required_width: int = REQUIRED_IMAGE_WIDTH) -> None:
+    width, height = png_dimensions(path)
+    if width <= 0 or height <= 0:
+        fail(f"画像寸法が不正です: {path} ({width}x{height})")
+    if width == required_width:
         return
-    target_ratio, _ = parse_target_ratio(meta["target_ratio"], num)
-    meta["target_ratio"] = target_ratio
-    if "height_type" not in meta:
+    sips = shutil.which("sips")
+    if not sips:
+        print(f"WARNING: {path} の横幅が {width}px です。{required_width}pxへ補正するための sips が見つからないため、Issues に記録してください。", file=sys.stderr)
         return
-    height_type = str(meta.get("height_type", "")).strip().lower()
-    if height_type not in ALLOWED_HEIGHT_TYPES:
-        fail(
-            f"プロンプト{num}: height_type は short / standard / tall / custom のいずれかにしてください: "
-            f"{height_type or '未指定'}"
-        )
-    if height_type != "custom" and target_ratio not in ALLOWED_TARGET_RATIOS[height_type]:
-        allowed = " / ".join(sorted(ALLOWED_TARGET_RATIOS[height_type]))
-        fail(
-            f"プロンプト{num}: height_type={height_type} の target_ratio は {allowed} のいずれかにしてください: "
-            f"{target_ratio}"
-        )
-    meta["height_type"] = height_type
-    meta["target_ratio"] = target_ratio
-
-
-def find_target_ratio_mismatches(manifest: list[dict]) -> list[str]:
-    """完成PNGとmanifestの目標比率の不一致を返す。"""
-    issues: list[str] = []
-    for index, item in enumerate(manifest, start=1):
-        if not isinstance(item, dict):
-            fail(f"manifest.json: {index}件目がオブジェクトではありません")
-        output = item.get("expected_output")
-        if not output:
-            fail(f"manifest.json: {index}件目に expected_output がありません")
-        if "target_ratio" not in item:
-            continue
-        target_ratio, target_value = parse_target_ratio(item["target_ratio"], index)
-        width, height = png_dimensions(Path(str(output)))
-        actual_value = width / height
-        if abs(actual_value - target_value) / target_value > TARGET_RATIO_TOLERANCE:
-            issues.append(
-                f"{Path(str(output)).name}: 目標 {target_ratio} / 実寸 {width}x{height}"
-            )
-    return issues
+    new_height = max(1, round(height * required_width / width))
+    result = subprocess.run(
+        [sips, "-z", str(new_height), str(required_width), str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(f"WARNING: {path} を横幅{required_width}pxへ補正できませんでした。Issues に記録してください。\n{result.stderr.strip()}", file=sys.stderr)
+        return
+    normalized_width, _ = png_dimensions(path)
+    if normalized_width != required_width:
+        print(f"WARNING: {path} の横幅補正後チェックに失敗しました: {normalized_width}px。Issues に記録してください。", file=sys.stderr)
 
 
 def normalize_text(value: str) -> str:
@@ -383,63 +327,10 @@ def extract_background_plan(input_md: Path) -> dict | None:
     return {
         "palette": palette,
         "zones": zones,
-        "size_policy": validate_size_policy(meta),
         "content_surface_policy": validate_content_surface_policy(
             meta.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)
         ),
     }
-
-
-def validate_size_policy(meta: dict) -> dict | None:
-    """幅の2項目を検証する。旧H2値は生成基準へ持ち込まない。"""
-    present = SIZE_POLICY_KEYS & meta.keys()
-    if not present:
-        return None
-    missing = SIZE_POLICY_KEYS - meta.keys()
-    if missing:
-        fail("サイズ基準: 不足項目: " + ", ".join(sorted(missing)))
-    values = {}
-    for key in sorted(SIZE_POLICY_KEYS):
-        raw = str(meta[key]).strip()
-        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw):
-            fail(f"サイズ基準: {key} は単位なしの有限な正数にしてください")
-        value = float(raw)
-        if not 0 < value <= 1440:
-            fail(f"サイズ基準: {key} は0より大きく1440以下にしてください")
-        values[key] = value
-    if values["layout_viewport_px"] != 1440:
-        fail("サイズ基準: PCの基準画面幅は1440pxにしてください")
-    if values["content_width_px"] >= values["layout_viewport_px"]:
-        fail("サイズ基準: コンテンツ内側幅は基準画面幅より小さくしてください")
-    return values
-
-
-def size_policy_prompt_lines(policy: dict | None) -> list[str]:
-    if not policy:
-        return []
-    return [
-        "- 基準画面幅は1440px。以下の内側幅はCSS相当であり、PNGの画素数とは区別する。出力幅Wの画像上では内側幅をW/1440倍で表現する。",
-        f"- 主要コンテンツの内側幅は{policy['content_width_px']:g}px、中央配置。これはpaddingを含む外寸ではなく、本文・カード群を収める領域の最大幅。短文まで引き伸ばさない。",
-        "- 背景と意図的な大きな写真は左右全幅に広げてよい。ただし同じ背景ゾーンに接する上下辺の保護は維持する。",
-    ]
-
-
-def verify_size_policy_handoff(project_dir: Path, page: str, policy: dict | None) -> None:
-    """05の採用値が06への転記で消えたり変わったりしていないか確認する。"""
-    plan = project_dir / "_src" / page / "section-plan.md"
-    if not plan.exists():
-        return
-    content = plan.read_text(encoding="utf-8")
-    heading = re.search(r"^## サイズ基準\s*$", content, re.MULTILINE)
-    if not heading:
-        return
-    section = re.split(r"\n## ", content[heading.end():], maxsplit=1)[0]
-    block = re.search(r"```yaml\n([\s\S]+?)```", section)
-    if not block:
-        fail("section-plan.md: サイズ基準のYAMLがありません")
-    expected = validate_size_policy(parse_yaml_meta(block.group(1)))
-    if expected is None or expected != policy:
-        fail("サイズ基準: section-plan.mdとsection-prompts.mdの幅の2項目が一致しません")
 
 
 def legacy_background_plan(prompts: list[dict]) -> dict:
@@ -552,6 +443,20 @@ def display_text_values(display_text: str) -> list[str]:
     return values
 
 
+def display_text_roles(display_text: str) -> set[str]:
+    """`役割: 表示文字` から文字階層の判定に使う役割名だけを取り出す。"""
+    roles: set[str] = set()
+    for raw_line in display_text.splitlines():
+        line = re.sub(r"^\s*[-*]\s*", "", raw_line).strip()
+        if not line or (":" not in line and "：" not in line):
+            continue
+        role = re.split(r"[:：]", line, maxsplit=1)[0].strip().lower()
+        role = re.sub(r"[0-9０-９]+$", "", role)
+        if role:
+            roles.add(role)
+    return roles
+
+
 def format_display_text_for_prompt(display_text: str) -> str:
     """表示値を変えず、反復項目の役割ラベルだけを個別prompt向けに明確化する。"""
     counters: dict[str, int] = {}
@@ -609,12 +514,74 @@ def format_display_text_for_prompt(display_text: str) -> str:
     return "\n".join(output)
 
 
+def has_faq_text_hierarchy(display_text: str) -> bool:
+    roles = display_text_roles(display_text)
+    has_question = bool(roles & {"q", "質問"})
+    has_answer = bool(roles & {"a", "回答"})
+    return has_question and has_answer
+
+
+def inferred_text_scale_profile(item: dict) -> str:
+    """セクション名と表示役割から旧入力の文字スケールを補完する。"""
+    meta = item["meta"]
+    display_text = str(meta.get("display_text_exact", ""))
+    label = " ".join(
+        [str(item.get("title", "")), *[str(value) for value in meta.get("target_sections", [])]]
+    ).lower()
+    if has_faq_text_hierarchy(display_text) or re.search(r"\bfaq\b|よくある質問", label):
+        return "faq-compact"
+    if re.search(r"\bnews\b|お知らせ|新着情報", label):
+        return "news-compact"
+    if re.search(
+        r"(?:お客様|お客さん|患者(?:さま|様)?|利用者|受講者|宿泊者|先輩移住者|ユーザー).*声|体験談|testimonials?|\bvoice\b",
+        label,
+    ):
+        return "voice-reading"
+    return DEFAULT_TEXT_SCALE_PROFILE
+
+
+def validate_text_scale_profile(item: dict) -> str:
+    """文字スケールプロファイルを検証し、旧入力ではセクション種別から補完する。"""
+    num = int(item["num"])
+    meta = item["meta"]
+    inferred = inferred_text_scale_profile(item)
+    raw = str(meta.get("text_scale_profile", "")).strip()
+    profile = raw or inferred
+    if profile not in ALLOWED_TEXT_SCALE_PROFILES:
+        allowed = " / ".join(sorted(ALLOWED_TEXT_SCALE_PROFILES))
+        fail(
+            f"プロンプト{num}: text_scale_profile は {allowed} のいずれかにしてください: "
+            f"{profile or '未指定'}"
+        )
+    if inferred != DEFAULT_TEXT_SCALE_PROFILE and profile != inferred:
+        fail(
+            f"プロンプト{num}: このセクションの text_scale_profile は "
+            f"{inferred} にしてください: {profile}"
+        )
+    meta["text_scale_profile"] = profile
+    return profile
+
+
 def forbids_icons(special_direction: str) -> bool:
     normalized = normalize_text(special_direction)
     return any(
         phrase in normalized
         for phrase in ("アイコンを使わない", "アイコンは使わない", "アイコンなし")
     )
+
+
+def validate_fv_expression(value: object, num: int) -> str:
+    """工程05が選んだ特徴を受け取り、欠落を非対象と解釈しない。"""
+    if not isinstance(value, str) or not value.strip():
+        fail(f"プロンプト{num}: fv_expression に具体的な特徴または `なし` を記録してください")
+    value = value.strip()
+    if len(value) > 160 or len(value.splitlines()) != 1:
+        fail(f"プロンプト{num}: fv_expression は1行・160文字以内にしてください")
+    if re.search(r"```|`?(?:source_text_exact|target_sections|expected_output_file|section_purpose)`?", value):
+        fail(f"プロンプト{num}: fv_expression に管理メタを入れないでください")
+    if re.search(r"\d+(?:\.\d+)?\s*px|(?:x|y)\s*=|\d+\s*カラム|カード幅|余白量|左右比率", value, re.IGNORECASE):
+        fail(f"プロンプト{num}: fv_expression に詳細レイアウト指定を入れないでください")
+    return value
 
 
 def forbids_photo(special_direction: str) -> bool:
@@ -624,12 +591,12 @@ def forbids_photo(special_direction: str) -> bool:
 
 
 def validate_special_direction(value: object, num: int) -> str:
-    """任意の見せ方を検証し、旧形式の項目も不足補完せず受け取る。"""
+    """簡易アートディレクションを固定スキーマへ正規化する。"""
     if not isinstance(value, str) or not value.strip():
         fail(f"プロンプト{num}: special_direction が空です")
 
     parsed: dict[str, str] = {}
-    allowed_roles = {"見せ方", *ART_DIRECTION_ROLES, "特別な演出"}
+    allowed_roles = {*ART_DIRECTION_ROLES, "特別な演出"}
     for raw_line in value.splitlines():
         line = re.sub(r"^\s*[-*]\s*", "", raw_line).strip()
         if not line:
@@ -638,7 +605,7 @@ def validate_special_direction(value: object, num: int) -> str:
         if not match:
             fail(
                 f"プロンプト{num}: special_direction は "
-                "`見せ方`（旧形式は `主役 / 統合 / 奥行き / 見せ場`）と任意の `特別な演出` で記録してください: "
+                "`主役 / 統合 / 奥行き / 見せ場` と任意の `特別な演出` だけで記録してください: "
                 f"{line}"
             )
         role, direction = match.group(1).strip(), match.group(2).strip()
@@ -646,13 +613,22 @@ def validate_special_direction(value: object, num: int) -> str:
             fail(f"プロンプト{num}: special_direction に未許可の項目があります: {role}")
         if role in parsed:
             fail(f"プロンプト{num}: special_direction の項目が重複しています: {role}")
+        if len(direction) > 160:
+            fail(f"プロンプト{num}: special_direction の `{role}` は160文字以内にしてください")
         if re.search(r"```|`?(?:source_text_exact|target_sections|expected_output_file|section_purpose)`?", direction):
             fail(f"プロンプト{num}: special_direction の `{role}` に管理メタを入れないでください")
         if re.search(r"\b\d+(?:\.\d+)?\s*px\b|\b(?:x|y)\s*=|\d+\s*カラム|カード幅|余白量|左右比率", direction, re.IGNORECASE):
             fail(f"プロンプト{num}: special_direction の `{role}` に詳細レイアウト指定を入れないでください")
         parsed[role] = direction
 
-    normalized = [f"{role}: {parsed[role]}" for role in ("見せ方", *ART_DIRECTION_ROLES) if role in parsed]
+    missing = [role for role in ART_DIRECTION_ROLES if role not in parsed]
+    if missing:
+        fail(
+            f"プロンプト{num}: special_direction に簡易アートディレクション4項目が不足しています: "
+            + ", ".join(missing)
+        )
+
+    normalized = [f"{role}: {parsed[role]}" for role in ART_DIRECTION_ROLES]
     if "特別な演出" in parsed and normalize_text(parsed["特別な演出"]) != "なし":
         normalized.append(f"特別な演出: {parsed['特別な演出']}")
     return "\n".join(normalized)
@@ -662,6 +638,7 @@ def validate_content_surface_compatibility(
     special_direction: str,
     policy: str,
     num: int,
+    field_name: str = "special_direction",
 ) -> None:
     """簡易アートディレクションとページ共通の実装方針の矛盾を止める。"""
     if policy != "code-friendly-standard":
@@ -674,13 +651,15 @@ def validate_content_surface_compatibility(
     ]
     if conflicts:
         fail(
-            f"プロンプト{num}: special_direction が content_surface_policy=code-friendly-standard "
+            f"プロンプト{num}: {field_name} が content_surface_policy=code-friendly-standard "
             "と矛盾しています。紙・布・水彩の表面テクスチャ、破れた縁、不規則な輪郭を除くか、"
             "ユーザーの明示指定がある場合だけ texture-asset-explicit を選んでください"
         )
 
 
-def validate_implementation_independence(special_direction: str, num: int) -> None:
+def validate_implementation_independence(
+    special_direction: str, num: int, field_name: str = "special_direction"
+) -> None:
     """複数要素の描き直しを前提にする視覚統合を生成前に止める。"""
     normalized = normalize_text(special_direction)
     has_material = IMPLEMENTATION_DEPENDENCY_MATERIAL_PATTERN.search(normalized)
@@ -688,7 +667,7 @@ def validate_implementation_independence(special_direction: str, num: int) -> No
     has_exemption = IMPLEMENTATION_INDEPENDENCE_EXEMPTION_PATTERN.search(normalized)
     if has_material and has_action and not has_exemption:
         fail(
-            f"プロンプト{num}: special_direction が実装独立性と矛盾しています。"
+            f"プロンプト{num}: {field_name} が実装独立性と矛盾しています。"
             "線・マスク・切り抜き・装飾・合成・コラージュで複数要素を一体化せず、"
             "共通色・書体・文字階層・輪郭・アイコン・余白・反復規則・背景面で関係づけるか、"
             "1要素内で完結する装飾または位置に依存しない独立素材として明示してください"
@@ -752,23 +731,17 @@ def validate_prompt_meta(
                 fail(
                     f"プロンプト{num}: display_text_exact の値が source_text_exact に見つかりません: {visible_value}"
                 )
-        meta.pop("text_scale_profile", None)  # 旧プロファイルは受け取るだけで再適用しない。
-        if "decoration_level" in meta:
-            decoration_level = str(meta["decoration_level"]).strip()
-            if decoration_level not in ALLOWED_DECORATION_LEVELS:
-                allowed = " / ".join(sorted(ALLOWED_DECORATION_LEVELS))
-                fail(
-                    f"プロンプト{num}: decoration_level は {allowed} のいずれかにしてください: "
-                    f"{decoration_level or '空欄'}"
-                )
-            meta["decoration_level"] = decoration_level
-        if "special_direction" in meta:
-            meta["special_direction"] = validate_special_direction(meta["special_direction"], num)
-            validate_content_surface_compatibility(
-                str(meta["special_direction"]), content_surface_policy, num
-            )
-            validate_implementation_independence(str(meta["special_direction"]), num)
-        validate_height_meta(meta, num)
+        validate_text_scale_profile(item)
+        meta["special_direction"] = validate_special_direction(meta["special_direction"], num)
+        meta["fv_expression"] = validate_fv_expression(meta["fv_expression"], num)
+        validate_content_surface_compatibility(
+            str(meta["special_direction"]), content_surface_policy, num
+        )
+        validate_implementation_independence(str(meta["special_direction"]), num)
+        validate_content_surface_compatibility(
+            meta["fv_expression"], content_surface_policy, num, "fv_expression"
+        )
+        validate_implementation_independence(meta["fv_expression"], num, "fv_expression")
         expected_output_file = validate_expected_output_file(meta["expected_output_file"], page, num)
         if expected_output_file in expected_files:
             fail(f"プロンプト{num}: expected_output_file が重複しています: {expected_output_file}")
@@ -906,14 +879,6 @@ def write_revision_tasks(
 
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    source_prompts = base / "_src" / page / "section-prompts.md"
-    revision_size_policy = None
-    if source_prompts.exists():
-        source_plan = extract_background_plan(source_prompts)
-        if source_plan:
-            revision_size_policy = source_plan.get("size_policy")
-    verify_size_policy_handoff(base, page, revision_size_policy)
-
     manifest: list[dict] = []
     queue_lines = [
         f"# 修正画像生成タスク — {page}",
@@ -942,9 +907,8 @@ def write_revision_tasks(
                 f"添付された対象mock-up画像 `{target}` をベースにしてください。",
                 "対象外のセクションや画像は変更しないでください。",
                 "修正後の画像は expected_output のパスへ保存し、同じ位置のmock-upとして差し替えてください。",
-                f"修正後のPNGは可能なら横幅{REQUESTED_IMAGE_WIDTH}pxにしてください。Imagegenが異なる幅を返した場合は加工せず原寸で保存してください。レイアウトは1440px幅のWebセクションとして扱い、横に広い別レイアウトにはしないでください。",
+                f"修正後のPNGは横幅{REQUIRED_IMAGE_WIDTH}pxを目安にしてください。レイアウトは1440px幅のWebセクションとして扱い、横に広い別レイアウトにはしないでください。",
                 revision_prompt,
-                "\n".join([*TYPOGRAPHY_PROMPT_LINES, *size_policy_prompt_lines(revision_size_policy)]),
             ]
         )
 
@@ -959,7 +923,7 @@ def write_revision_tasks(
                     "- style_ref: なし",
                     "- style_ref_attachment_required: no",
                     "- style_ref_attachment_status: not_required",
-                    f"- requested_image_width: {REQUESTED_IMAGE_WIDTH}px",
+                    f"- required_image_width: {REQUIRED_IMAGE_WIDTH}px",
                     "- revision_request: `" + str(revision_md) + "`",
                     "",
                     "## 生成プロンプト",
@@ -972,7 +936,7 @@ def write_revision_tasks(
                     "",
                     "- `expected_output` の画像だけが更新されているか確認する。",
                     "- 対象外mock-up画像を再生成していないか確認する。",
-                    f"- 横幅{REQUESTED_IMAGE_WIDTH}pxは希望値として確認する。異なる場合は補正せず、原寸を記録して使用する。",
+                    f"- 保存したPNGの横幅が{REQUIRED_IMAGE_WIDTH}pxであることを確認する。違う場合は横幅{REQUIRED_IMAGE_WIDTH}pxへ補正する。",
                     "- 保存後、`mockups/top/full_preview.html` をmanifest順で更新する。",
                     "",
                 ]
@@ -1031,39 +995,45 @@ def background_zone_details(background_plan: dict, zone_id: str) -> tuple[str, s
     return str(zone["palette_id"]), str(palette["value"]), str(zone["treatment"])
 
 
-def protected_edge_label(sections: list[dict], index: int) -> str | None:
-    """背景ゾーンの隣接関係から保護する接続辺を返す。"""
-    zone_id = str(sections[index]["background_zone"])
-    same_top = index > 0 and str(sections[index - 1]["background_zone"]) == zone_id
-    same_bottom = (
-        index + 1 < len(sections)
-        and str(sections[index + 1]["background_zone"]) == zone_id
+def same_zone_edge_prompt_lines(
+    sections: list[dict],
+    index: int,
+    background_plan: dict | None = None,
+) -> list[str]:
+    """同じゾーンIDまたは背景色へ接する上下端の保護指示を返す。"""
+    zone_palette_by_id = (
+        {
+            str(zone["id"]): str(zone["palette_id"])
+            for zone in background_plan["zones"]
+        }
+        if background_plan is not None
+        else {}
+    )
+
+    def shares_base_background(first: dict, second: dict) -> bool:
+        first_zone = str(first["background_zone"])
+        second_zone = str(second["background_zone"])
+        if first_zone == second_zone:
+            return True
+        first_palette = zone_palette_by_id.get(first_zone) or str(
+            first.get("palette_id", "")
+        )
+        second_palette = zone_palette_by_id.get(second_zone) or str(
+            second.get("palette_id", "")
+        )
+        return bool(first_palette) and first_palette == second_palette
+
+    current = sections[index]
+    same_top = index > 0 and shares_base_background(sections[index - 1], current)
+    same_bottom = index + 1 < len(sections) and shares_base_background(
+        current, sections[index + 1]
     )
     if not same_top and not same_bottom:
-        return None
-    return "上端と下端" if same_top and same_bottom else "上端" if same_top else "下端"
-
-
-def same_zone_edge_prompt_lines(sections: list[dict], index: int) -> list[str]:
-    """同じ背景ゾーンへ接する辺の、検証可能な完了条件を返す。"""
-    edge = protected_edge_label(sections, index)
-    if edge is None:
         return []
+    edge = "上端・下端" if same_top and same_bottom else "上端" if same_top else "下端"
     return [
-        f"- 接続する{edge}の全幅は背景ゾーンの背景面だけにし、図形、線、写真、カード、影、光、グラデーション、マスクを接触させない。",
-        f"- FVの外周に接する装飾を接続する{edge}へコピーしない。",
+        f"- 接続する{edge}には全幅で背景だけの余白を残し、文字・写真・装飾・影・光を入れない。",
     ]
-
-
-def decoration_prompt_line(decoration_level: str, protected_edge: str | None) -> str:
-    """あしらい量と接続辺保護を競合しない1文へまとめる。"""
-    base = DECORATION_PROMPT_LINES[decoration_level]
-    if protected_edge is None:
-        return base
-    return (
-        f"{base} 接続する{protected_edge}から離し、"
-        "あしらいはすべて画像内で完結させる。"
-    )
 
 
 def build_individual_prompt(
@@ -1078,39 +1048,49 @@ def build_individual_prompt(
     content_surface_policy = validate_content_surface_policy(
         background_plan.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)
     )
-    direction = str(item.get("special_direction", "")).strip()
-    decoration_level = str(item["decoration_level"]).strip() if "decoration_level" in item else None
-    if decoration_level is not None and decoration_level not in ALLOWED_DECORATION_LEVELS:
-        fail(f"個別prompt: 未対応の decoration_level です: {decoration_level}")
-    protected_edge = None
-    if same_zone_edge_lines:
-        match = re.search(r"接続する(上端と下端|上端|下端)", same_zone_edge_lines[0])
-        protected_edge = match.group(1) if match else None
+    text_scale_profile = str(
+        item.get("text_scale_profile", DEFAULT_TEXT_SCALE_PROFILE)
+    ).strip()
+    if text_scale_profile not in ALLOWED_TEXT_SCALE_PROFILES:
+        fail(f"個別prompt: 未対応の text_scale_profile です: {text_scale_profile}")
+    direction = str(item["special_direction"]).strip()
+    fv_expression = validate_fv_expression(item.get("fv_expression"), int(item["num"]))
     lines = [
         "$imagegen",
         "",
+        *([*same_zone_edge_lines, ""] if same_zone_edge_lines else []),
         "## 生成対象",
         "",
         f"- 目的: {item['section_purpose']}",
         f"- 保存先: `{item['expected_output']}`",
-        (f"- 完成フレーム: 目標比率 `{item['target_ratio']}`" if item.get("target_ratio") else "- 完成フレーム: 文字の一貫性とコンテンツ幅を保ち、掲載内容に合う自然な高さで構成する。高さ・比率の数値は指定しない。"),
+        "- 指定された文字サイズを優先し、内容・写真・あしらいが欠けなく収まる自然な高さを画像生成側で決める。",
         f"- 背景ゾーン: `{item['background_zone']}` / `{palette_id}` / {palette_value} / {zone_treatment}",
-        f"- 出力: 可能なら横幅{REQUESTED_IMAGE_WIDTH}pxの高精細PNG。異なる幅で生成された場合は原寸を維持する",
+        "- 指定された単色またはグラデーションを画像全体のベース背景に使い、グラデーションは構成色と方向も維持する。",
+        f"- 出力: 横幅{REQUIRED_IMAGE_WIDTH}pxの高精細PNG",
         "",
-        "## 文字の扱い",
+        "## 文字サイズ（最優先）",
         "",
-        *TYPOGRAPHY_PROMPT_LINES,
+        "- ここで指定するpxは、1440px幅のPC表示におけるCSS相当サイズとして扱い、出力PNGの画素数に合わせて倍化しない。",
+        "- 構図や余白を埋める判断より、この文字サイズを優先する。",
+        "- 日本語H2は35〜40px程度、本文は15px程度を共通基準にする。",
+        "- 下記の文字スケールプロファイルに役割別の指定がある場合は、共通の本文15px基準より優先する。",
+        f"- 文字スケールプロファイル: `{text_scale_profile}`。",
+        *TEXT_SCALE_PROMPT_LINES[text_scale_profile],
+        "- 通常のPC版Webサイトとして構成し、ポスターやプレゼン資料のような巨大文字にしない。",
         "",
         "## 共通デザイン",
         "",
-        *size_policy_prompt_lines(background_plan.get("size_policy")),
         f"- `--image {selected_fv_image}` で添付された採用FVをスタイル参照として使う。",
-        "- 採用FVの配色、書体の系統と太さ、角丸、線、アイコン、イラスト、ボタン、UIの雰囲気を継承する。",
+        "- 採用FVから全体で継承するのは、配色、書体の系統と太さ、角丸、線の太さ、基本UI、使用するアイコン・イラストの画風などの基礎トーン。",
         "- 写真とイラストの構成も採用FVに合わせる。採用FVが写真とイラストの組み合わせなら、FV以下もページ全体として両方を使い、内容に合うセクションへ配分する。採用FVがイラストのみなら、明示指定がない限り写真を追加しない。",
+        "- 写真・イラストの構成の継承は、FVの写真枚数・並べ方・トリミングを繰り返す指定ではない。",
         "- 写真を使う場合は、採用FVから色調、光、撮影品質だけを継承する。",
+        "- 人物写真を使う場合は、FV写真の人物と同じ顔を再現せず、異なる顔立ちの人物を使う。複数人を描く場合も、顔立ち・髪型・年齢感に自然な違いをつけ、似た顔の繰り返しを避ける。",
         "- FVのレイアウト、FVのH1サイズ、FV固有の装飾モチーフを機械的にコピーしない。",
-        ("- 共通サイズ基準の内側幅を守り、文字、CTA、人物の顔を画面端で切らない。" if background_plan.get("size_policy") else "- 文字、CTA、人物の顔などの主要部分を画面端で切らず、左右に自然な余白を残す。固定pxでは判定しない。"),
-        "- 背景色は画面端まで広げてよい。背景色以外は、同じ背景ゾーンと接する辺まで広げない。",
+        "- 文字、CTA、人物の顔などの主要部分を画面端で切らない。",
+        "- 1440px幅のPC表示換算で、見出し・本文・ボタンなどの情報要素は画面の左右端から最低120px離す。右寄せにも同じ基準を適用する。",
+        "- この最低余白を確保したうえで、配置や余白は内容に合わせて決め、全セクションを同じ配置・同じ余白に揃えない。写真・背景装飾は左右端まで広げてよい。",
+        "- 背景色、背景写真、意味を持たない背景装飾は左右端、および隣接mock-upと背景色が異なる上下端まで広げてよい。",
         "- 同じ背景ゾーンの途中へ、区切り線、色差、グラデーションの切り替わりを追加しない。",
         "",
         "## 実装可能性",
@@ -1125,10 +1105,17 @@ def build_individual_prompt(
         "",
         "## 見せ方",
         "",
-        "- 個別指定がない見せ方・あしらい・アイコンは、内容と採用FVの雰囲気に応じて判断する。",
-        *([decoration_prompt_line(decoration_level, protected_edge)] if decoration_level is not None else []),
+        f"- FVから使う特徴: {fv_expression}",
+        (
+            "- 記録されたFVの特徴を、このセクションの内容に合わせて取り入れる。FV全体の構図や特徴一式は再現せず、記録にない特徴を追加しない。"
+            if fv_expression != "なし"
+            else "- 共通スタイルのみ継承し、FV特有の写真の見せ方、写真枠、大きな線や図形、要素の重ね方は繰り返さない。写真や装飾は禁止せず、内容に合う独自の見せ方を考える。"
+        ),
     ]
-    lines.extend(f"- {line.strip()}" for line in direction.splitlines() if line.strip())
+    if normalize_text(direction) == "なし":
+        lines.append("- なし")
+    else:
+        lines.extend(f"- {line.strip()}" for line in direction.splitlines() if line.strip())
     if item["combine_sections_explicit"] == "yes":
         lines.append("- 指定された2セクションを、この画像だけは1枚にまとめる。")
     lines.extend(
@@ -1165,11 +1152,9 @@ def build_individual_prompt(
             "",
             "## 完了条件",
             "",
-            f"- 完成PNGは可能なら横幅{REQUESTED_IMAGE_WIDTH}pxで指定保存先へ保存する。異なる幅で生成された場合は加工せず原寸で保存する。",
-            "- 文字、写真、あしらい、背景変化を完成フレーム内へ収め、主要要素を切って比率を合わせない。",
-            *(same_zone_edge_lines or []),
-            ("- この個別プロンプトは1回生成する。目標比率と異なる場合だけ1回再生成し、再生成後も異なる場合は再生成結果と実寸を記録して次へ進む。" if item.get("target_ratio") else "- この個別プロンプトは1回生成する。比率を理由に再生成せず、実寸を記録する。"),
-            "- 内容が窮屈でないか、不要な空きが多くないかを確認し、問題があれば自動再生成せず報告する。",
+            f"- 完成PNGを横幅{REQUIRED_IMAGE_WIDTH}pxで指定保存先へ保存する。高さは生成結果に合わせ、幅補正時は縦横比を保つ。",
+            "- 文字、写真、あしらいを欠けなく配置する。",
+            "- この個別プロンプトは1回だけ実行し、生成結果を採用する。理由を問わず自動再生成しない。",
             "- 生成または保存に失敗した場合は、別方式や同じプロンプトの再実行へ切り替えず停止する。",
         ]
     )
@@ -1190,8 +1175,7 @@ def build_batch_prompt(
         "- 各完成PNGは、必ず `$imagegen` によるAI画像生成で作る。添付FVは全画像のスタイル参照として使う。",
         "- HTML/CSSレンダリング、Playwrightなどのブラウザ撮影、Canvas、SVG、手作業の画像合成を完成mock-upの生成元にしない。",
         "- 日本語文字の正確さを理由に、HTML/CSSやブラウザ撮影へ切り替えない。軽微な文字差は許容する。",
-        ("- 各対象は1回生成する。目標比率がある対象に限り、目標比率と異なる場合だけ1回再生成し、再生成後も異なる場合は再生成結果と実寸を記録して次へ進む。比率未指定の対象は比率を理由に再生成しない。" if any(item.get("target_ratio") for item in manifest) else "- 各対象は1回生成する。比率を理由に再生成しない。"),
-        "- 生成・保存の失敗時は生成済み画像を保持して停止する。",
+        "- 各個別プロンプトは1回だけ実行し、理由を問わず自動再生成しない。失敗時は生成済み画像を保持して停止する。",
         "",
         "目的:",
         "添付FVから続く1つのWebサイトとして、個別プロンプトからFV下のmock-upを1枚ずつ生成する。",
@@ -1201,9 +1185,9 @@ def build_batch_prompt(
         f"この子Codex実行には `--image {selected_fv_image}` で採用FV画像が添付されている。",
         "",
         "ページ全体で守る3つの共通ルール:",
-        "1. 背景ゾーンの連続性: 同じ背景ゾーンでは背景色だけを連続させ、セクション境界にあしらいを配置しない。",
-        "2. 文字の一貫性: 同じ役割の文字の大きさ・階層感を全mock-upで揃える。巨大文字や余白を埋めるための拡大を避ける。",
-        "3. FVの雰囲気継承: 添付FVの配色、書体の系統と太さ、角丸、線、アイコン、イラスト、ボタンに加え、写真のみ・イラストのみ・写真とイラストの組み合わせという構成も受け継ぐ。写真は色調、光、撮影品質だけを継承し、FV写真そのもの、切り抜き、ほぼ同一の再現、同一のポーズ・背景・構図は使用しない。FVのレイアウト、H1サイズ、装飾モチーフを機械的にコピーしない。",
+        "1. 背景ゾーンの連続性: 同じ背景ゾーンのmock-upを1つの連続した背景面として扱い、背景を変えるのはゾーンが変わる時だけにする。",
+        "2. H2と本文の統一: 日本語H2は1440px表示換算で35〜40px程度、本文は15px程度を全mock-up共通の基準にする。数字、短い英語、背景用の飾り文字は、内容上必要な時だけ大きくしてよい。",
+        "3. FVの雰囲気継承: 配色・書体・角丸・線の太さ・基本UIなどの共通スタイルは全体で揃える。FV特有の表現は、工程05が決めた各個別promptの「FVから使う特徴」に従い、使用箇所や特徴を追加しない。写真のみ・イラストのみ・写真とイラストの組み合わせという構成はページ全体で受け継ぐが、写真枚数や並べ方は繰り返さない。写真は色調、光、撮影品質だけを継承し、FV写真そのもの、切り抜き、ほぼ同一の再現、同一のポーズ・背景・構図は使用しない。FVのレイアウト、H1サイズ、装飾モチーフを機械的にコピーしない。",
         "",
     ]
     lines.extend(["背景計画（ページ共通）:", "背景パレット:"])
@@ -1233,7 +1217,6 @@ def build_batch_prompt(
                 f"mock-up {int(item['num'])}",
                 f"個別プロンプト: `{item['individual_prompt_file']}`",
                 f"保存先: `{item['expected_output']}`",
-                *([f"完成フレーム: 目標比率 `{item['target_ratio']}`"] if item.get("target_ratio") else []),
                 f"背景ゾーン: {item['background_zone']}",
             ]
         )
@@ -1243,10 +1226,9 @@ def build_batch_prompt(
             "",
             "完了条件:",
             f"- {len(manifest)}本の個別プロンプトを番号順に1本ずつ実行し、{len(manifest)}枚すべてを指定の保存先へ保存する。",
-            f"- 各PNGは横幅{REQUESTED_IMAGE_WIDTH}pxを希望値として確認する。異なる場合は補正・再生成せず、原寸を記録して使用する。",
-            ("- 目標比率があるPNGだけ比率を確認し、再生成の扱いは上記の実行条件に従う。" if any(item.get("target_ratio") for item in manifest) else "- 各PNGの実寸を記録する。比率の合否判定はしない。"),
+            f"- 各PNGの横幅が{REQUIRED_IMAGE_WIDTH}pxか確認する。違う場合は可能な範囲で補正する。",
             "- 画像は原則1セクション1枚に分ける。2セクションを1枚にするのは、上で明示したmock-upだけにする。",
-            "- 内容の窮屈さ・不要な空き、文字の一貫性・過度な拡大を目視し、問題があれば自動再生成せず報告する。それ以外の流体表現、文言、構成、セクション間統一の品質検査は行わない。",
+            "- 画像内容に対する流体表現、文言、構成、セクション間統一の品質検査は行わない。",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -1271,13 +1253,13 @@ def write_prompt_spec(
 ) -> Path:
     """画像生成へ渡す前の構造化prompt正本を保存する。"""
     spec = {
-        "schema_version": 6,
+        "schema_version": 7,
         "page": page,
         "mode": mode,
         "source": str(input_md),
         "output_dir": str(out_dir),
         "style_ref": str(selected_fv_image),
-        "style_ref_scope": "採用FV画像の配色・書体の系統と太さ・角丸・線・アイコン・イラスト・ボタンの雰囲気。FVレイアウト、H1サイズ、モチーフは機械的にコピーしない",
+        "style_ref_scope": "共通スタイルは全体で継承し、FV特有の表現は各fv_expressionに従う。FV全体の構図や特徴一式は再現しない",
         "reference_image_sha256": selected_fv_sha256,
         "generation_surface": "codex-cli-attached-image",
         "page_flow": page_flow,
@@ -1351,7 +1333,6 @@ def write_imagegen_tasks(
     background_plan = extract_background_plan(input_md)
     if background_plan is None:
         background_plan = legacy_background_plan(prompts)
-    verify_size_policy_handoff(base, page, background_plan.get("size_policy"))
     validate_background_plan(background_plan, prompts)
     content_surface_policy = validate_content_surface_policy(
         background_plan.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)
@@ -1374,7 +1355,7 @@ def write_imagegen_tasks(
                 "codex",
                 "exec",
                 "--model",
-                "gpt-5.6-sol",
+                "gpt-6-sol",
                 "--config",
                 'model_reasoning_effort="xhigh"',
                 "--cd",
@@ -1404,9 +1385,9 @@ def write_imagegen_tasks(
         f"- style_ref: `{selected_fv_image}`（全タスク）",
         f"- prompt_spec: `{task_dir / 'prompt-spec.json'}`",
         "- generation_surface: `codex-cli-attached-image`",
-        "- child_model: `gpt-5.6-sol`",
+        "- child_model: `gpt-6-sol`",
         "- child_reasoning_effort: `xhigh`",
-        "- style_ref_scope: 全タスク（採用FVの配色・書体・角丸・線・アイコン・イラスト・ボタンの雰囲気）",
+        "- style_ref_scope: 共通スタイルは全体で継承し、FV特有の表現は各fv_expressionに従う",
         f"- reference_image_sha256: `{selected_fv_sha256}`",
         f"- page_flow: {page_flow if page_flow else 'なし'}",
         "- chain: なし（直前mock-up画像は参照しない）",
@@ -1442,20 +1423,21 @@ def write_imagegen_tasks(
                 "source_text_exact": meta["source_text_exact"],
                 "section_purpose": meta["section_purpose"],
                 "background_zone": meta["background_zone"],
-                **{key: meta[key] for key in ("height_type", "target_ratio") if key in meta},
+                "text_scale_profile": meta["text_scale_profile"],
                 "display_text_exact": meta["display_text_exact"],
-                **{key: meta[key] for key in ("decoration_level", "special_direction") if key in meta},
+                "special_direction": meta["special_direction"],
+                "fv_expression": meta["fv_expression"],
                 "content_surface_policy": content_surface_policy,
                 "reference_image": None,
                 "style_ref": str(item_style_ref),
                 "reference_image_sha256": selected_fv_sha256,
-                "style_ref_scope": "採用FV画像の配色・書体の系統と太さ・角丸・線・アイコン・イラスト・ボタンの雰囲気。FVレイアウト、H1サイズ、モチーフは機械的にコピーしない",
+                "style_ref_scope": "共通スタイルは全体で継承し、FV特有の表現は各fv_expressionに従う。FV全体の構図や特徴一式は再現しない",
                 "style_ref_attachment_required": style_ref_attachment_required,
                 "style_ref_attachment_status": "pending" if style_ref_attachment_required else "not_required",
                 "actual_image_input": "pending",
                 "image_input_method": "actual_image_input_parameter",
                 "generation_surface": "codex-cli-attached-image",
-                "requested_image_width": REQUESTED_IMAGE_WIDTH,
+                "required_image_width": REQUIRED_IMAGE_WIDTH,
                 "image_input_argument": batch_image_input_argument,
                 "batch_prompt_file": str(batch_prompt_file),
                 "child_run_log": str(batch_child_run_log),
@@ -1498,7 +1480,7 @@ def write_imagegen_tasks(
                 selected_fv_image,
                 background_plan,
                 item,
-                same_zone_edge_prompt_lines(manifest, index),
+                same_zone_edge_prompt_lines(manifest, index, background_plan),
             ),
             encoding="utf-8",
         )
@@ -1515,8 +1497,8 @@ def write_imagegen_tasks(
                     f"- combine_sections_explicit: {item['combine_sections_explicit']}",
                     f"- section_purpose: `{item['section_purpose']}`",
                     f"- background_zone: `{item['background_zone']}`",
-                    *[f"- {key}: `{item[key]}`" for key in ("height_type", "target_ratio") if key in item],
-                    *([f"- special_direction: `{item['special_direction']}`"] if "special_direction" in item else []),
+                    f"- special_direction: `{item['special_direction']}`",
+                    f"- fv_expression: `{item['fv_expression']}`",
                     f"- content_surface_policy: `{item['content_surface_policy']}`",
                     "- reference_image: なし",
                     f"- style_ref: `{item['style_ref']}`",
@@ -1525,7 +1507,7 @@ def write_imagegen_tasks(
                     "- actual_image_input: pending",
                     "- image_input_method: actual_image_input_parameter",
                     "- generation_surface: codex-cli-attached-image",
-                    f"- requested_image_width: {REQUESTED_IMAGE_WIDTH}px",
+                    f"- required_image_width: {REQUIRED_IMAGE_WIDTH}px",
                     f"- image_input_argument: `{item['image_input_argument']}`",
                     f"- batch_prompt_file: `{batch_prompt_file}`",
                     f"- child_run_log: `{child_run_log}`",
@@ -1548,10 +1530,10 @@ def write_imagegen_tasks(
                     "",
                     "## 出力チェック",
                     "",
-                    f"- 保存するPNGは横幅{REQUESTED_IMAGE_WIDTH}pxを希望値とする。",
-                    f"- 横幅が{REQUESTED_IMAGE_WIDTH}pxでない場合は、画像を加工せず原寸で使用し、幅だけを理由に再生成または停止しない。",
-                    *([f"- 完成PNGを目標比率 `{item['target_ratio']}` にする。重要な文字・写真・あしらいを切って合わせない。"] if item.get("target_ratio") else []),
-                    "- 内容の窮屈さ・不要な空き、文字の一貫性・過度な拡大を目視し、問題があれば自動再生成せず報告する。それ以外の流体表現、文言、構成、セクション間統一の品質検査は行わない。",
+                    f"- 保存したPNGの横幅は必ず{REQUIRED_IMAGE_WIDTH}pxにする。",
+                    f"- 横幅が{REQUIRED_IMAGE_WIDTH}pxでない場合は、プレビュー作成前にスクリプトが自動補正する。ただし生成タスク内でも保存直後に確認する。",
+                    "- 高さは生成結果に合わせ、幅補正時は縦横比を保つ。重要な文字・写真・あしらいを切らない。",
+                    "- 画像内容に対する流体表現、文言、構成、セクション間統一の品質検査は行わない。",
                     "",
                 ]
             ),
@@ -1569,8 +1551,8 @@ def write_imagegen_tasks(
                 f"- combine_sections_explicit: {item['combine_sections_explicit']}",
                 f"- section_purpose: `{item['section_purpose']}`",
                 f"- background_zone: `{item['background_zone']}`",
-                *[f"- {key}: `{item[key]}`" for key in ("height_type", "target_ratio") if key in item],
-                *([f"- special_direction: `{item['special_direction']}`"] if "special_direction" in item else []),
+                f"- special_direction: `{item['special_direction']}`",
+                f"- fv_expression: `{item['fv_expression']}`",
                 "- reference_image: なし",
                 f"- style_ref: `{item['style_ref']}`",
                 "- style_ref_attachment_required: yes",
@@ -1662,107 +1644,7 @@ def read_manifest(project_dir: Path, page: str) -> list[dict]:
             fail(f"{manifest_path}: {index}件目がオブジェクトではありません")
         if not item.get("expected_output"):
             fail(f"{manifest_path}: {index}件目に expected_output がありません")
-        if "target_ratio" in item:
-            parse_target_ratio(item["target_ratio"], index)
     return manifest
-
-
-def edge_band_metrics(path: Path, edge: str) -> dict[str, object]:
-    """画像端と少し内側の帯を測り、装飾や別色面の侵入を検出する。"""
-    try:
-        with Image.open(path) as source:
-            image = source.convert("RGB")
-    except Exception as exc:
-        fail(f"画像の接続辺を読み取れません: {path}: {exc}")
-    width, height = image.size
-    band_px = max(EDGE_BAND_MIN_PX, min(EDGE_BAND_MAX_PX, round(height * EDGE_BAND_RATIO)))
-    inset = min(height - band_px, band_px * 4)
-    if edge == "top":
-        edge_box = (0, 0, width, band_px)
-        inner_box = (0, inset, width, min(height, inset + band_px))
-    elif edge == "bottom":
-        edge_box = (0, height - band_px, width, height)
-        inner_bottom = max(band_px, height - inset)
-        inner_box = (0, max(0, inner_bottom - band_px), width, inner_bottom)
-    else:
-        raise ValueError(f"未対応の辺です: {edge}")
-    edge_stat = ImageStat.Stat(image.crop(edge_box))
-    inner_stat = ImageStat.Stat(image.crop(inner_box))
-    edge_mean = [round(float(value), 3) for value in edge_stat.mean[:3]]
-    inner_mean = [round(float(value), 3) for value in inner_stat.mean[:3]]
-    edge_stddev = [round(float(value), 3) for value in edge_stat.stddev[:3]]
-    inner_delta = sum((a - b) ** 2 for a, b in zip(edge_mean, inner_mean)) ** 0.5
-    return {
-        "band_px": band_px,
-        "edge_mean_rgb": edge_mean,
-        "edge_stddev_rgb": edge_stddev,
-        "max_edge_stddev": round(max(edge_stddev), 3),
-        "inner_mean_rgb": inner_mean,
-        "edge_to_inner_mean_delta": round(inner_delta, 3),
-    }
-
-
-def inspect_same_zone_edges(project_dir: Path, page: str, manifest: list[dict]) -> dict:
-    """同じ背景ゾーンの隣接辺を比較し、JSONレポートを保存する。"""
-    checks: list[dict] = []
-    for index in range(len(manifest) - 1):
-        current = manifest[index]
-        following = manifest[index + 1]
-        zone_id = str(current.get("background_zone", ""))
-        if not zone_id or str(following.get("background_zone", "")) != zone_id:
-            continue
-        current_path = Path(str(current["expected_output"]))
-        following_path = Path(str(following["expected_output"]))
-        bottom = edge_band_metrics(current_path, "bottom")
-        top = edge_band_metrics(following_path, "top")
-        pair_delta = sum(
-            (a - b) ** 2
-            for a, b in zip(bottom["edge_mean_rgb"], top["edge_mean_rgb"])
-        ) ** 0.5
-        reasons: list[str] = []
-        if float(bottom["max_edge_stddev"]) > EDGE_BAND_MAX_STDDEV:
-            reasons.append("上側mock-upの下端に背景面以外の変化がある可能性")
-        if float(top["max_edge_stddev"]) > EDGE_BAND_MAX_STDDEV:
-            reasons.append("下側mock-upの上端に背景面以外の変化がある可能性")
-        if float(bottom["edge_to_inner_mean_delta"]) > EDGE_BAND_MAX_MEAN_DELTA:
-            reasons.append("上側mock-upの下端が内側の背景面と大きく異なる")
-        if float(top["edge_to_inner_mean_delta"]) > EDGE_BAND_MAX_MEAN_DELTA:
-            reasons.append("下側mock-upの上端が内側の背景面と大きく異なる")
-        if pair_delta > EDGE_BAND_MAX_MEAN_DELTA:
-            reasons.append("隣接する上下端の平均色が大きく異なる")
-        checks.append(
-            {
-                "zone": zone_id,
-                "upper_mockup": str(current_path),
-                "upper_protected_edge": "bottom",
-                "lower_mockup": str(following_path),
-                "lower_protected_edge": "top",
-                "upper_edge_metrics": bottom,
-                "lower_edge_metrics": top,
-                "edge_pair_mean_delta": round(pair_delta, 3),
-                "status": "failed" if reasons else "passed",
-                "reasons": reasons,
-            }
-        )
-    failed = [check for check in checks if check["status"] == "failed"]
-    report = {
-        "status": "failed" if failed else "passed",
-        "method": "same-zone outer-band continuity heuristic",
-        "thresholds": {
-            "edge_band_ratio": EDGE_BAND_RATIO,
-            "max_edge_stddev": EDGE_BAND_MAX_STDDEV,
-            "max_mean_delta": EDGE_BAND_MAX_MEAN_DELTA,
-        },
-        "checks": checks,
-    }
-    report_path = project_dir / "_imagegen" / page / "edge-continuity-report.json"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    report["report_path"] = str(report_path)
-    return report
 
 
 def generate_full_preview_html(project_dir: Path, page: str) -> Path:
@@ -1779,22 +1661,8 @@ def generate_full_preview_html(project_dir: Path, page: str) -> Path:
 
     preview_items: list[Path] = [extract_selected_fv_image(project_dir)]
     preview_items.extend(images)
-    width_issues = find_requested_width_mismatches(preview_items)
-    if width_issues:
-        print(
-            "WARNING: 希望幅と異なる完成PNGがあります。画像は加工せず原寸のまま "
-            "full_preview.html の作成を続行します。\n"
-            + "\n".join(f"- {issue}" for issue in width_issues),
-            file=sys.stderr,
-        )
-    ratio_issues = find_target_ratio_mismatches(manifest)
-    if ratio_issues:
-        print(
-            "WARNING: 再生成後も目標比率と異なる完成PNGがあります。"
-            "実寸を記録して full_preview.html の作成を続行します。\n"
-            + "\n".join(f"- {issue}" for issue in ratio_issues),
-            file=sys.stderr,
-        )
+    for image in preview_items:
+        normalize_png_width(image)
 
     imgs_html = "\n".join(
         f'  <img src="{os.path.relpath(img, out_dir)}" alt="{img.stem}">'
@@ -1827,26 +1695,8 @@ img {{ width: 100%; max-width: 1440px; display: block; box-shadow: 0 2px 12px rg
 def write_preview_only(project_dir: str, page: str = "top", open_output: bool = False) -> None:
     base = Path(project_dir)
     html_path = generate_full_preview_html(base, page)
-    manifest = read_manifest(base, page)
-    edge_report = inspect_same_zone_edges(base, page, manifest)
     print("✅ full_preview.html を作成しました")
     print(f"   full_preview: {html_path}")
-    print(f"   接続辺検査: {edge_report['report_path']}")
-    if edge_report["status"] == "failed":
-        failed_lines = []
-        for check in edge_report["checks"]:
-            if check["status"] != "failed":
-                continue
-            failed_lines.append(
-                f"- {Path(check['upper_mockup']).name} 下端 ↔ "
-                f"{Path(check['lower_mockup']).name} 上端: "
-                + " / ".join(check["reasons"])
-            )
-        fail(
-            "同じ背景ゾーンの接続辺検査に失敗しました。生成済み画像は保持し、"
-            "自動再生成せず修正指示を待ってください。\n"
-            + "\n".join(failed_lines)
-        )
     if open_output:
         subprocess.run(["open", str(html_path)], check=False)
 

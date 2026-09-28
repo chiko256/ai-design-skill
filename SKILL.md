@@ -25,12 +25,17 @@ description: MCP認証付きのAIデザインSkill。webデザイン、AIデザ�
 
 更新のためにローカル変更の削除、強制reset、別リポジトリへの接続変更を行わない。
 
+### 2026.09.28.1 の設定移行
+
+更新後、Codexが使用中の`config.toml`にある`[mcp_servers.web-design-pro.http_headers]`の`X-Client-Version`を確認する。旧版なら、ほかの設定と契約者トークンを保持したまま`2026.09.28.1`へ更新する。設定変更後はCodexの再起動を案内し、再開後に契約確認へ進む。設定を変更できない場合は理由を報告し、旧版のヘッダーのまま新版の接続確認を完了扱いにしない。
+
 ## 起動
 
 1. MCPの`web_design_contract`を呼び、契約とバージョンが有効か確認する。
 2. 依頼を次のどちらかへ分類する。
    - TOP・LP・Webデザイン全体・Figma納品: `top`
    - 下層ページ制作: `lower`
+   - SP版制作: 元のPC版がTOP・LPなら`top`、下層ページなら`lower`
 3. `web_design_start`へ分類結果だけを渡す。ユーザー依頼本文は送らない。返された`sessionId`をこの依頼中だけ保持する。
 4. 入口手順に従い、子工程へ入る直前に`web_design_open_step`を呼ぶ。
 

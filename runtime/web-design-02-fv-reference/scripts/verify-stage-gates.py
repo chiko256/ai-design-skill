@@ -92,6 +92,8 @@ def file_errors(project: Path) -> list[str]:
             errors.append(f"cross-check gate: color tone not found in {label}")
         if not re.search(r"雰囲気:\s*\S", block):
             errors.append(f"cross-check gate: mood note not found in {label}")
+        if not re.search(r"惹かれる理由:\s*\S", block):
+            errors.append(f"cross-check gate: appeal reason not found in {label}")
 
     return errors
 
