@@ -15,6 +15,12 @@ readonly agent_label="com.ai-design-skill.web-design-pro-auth"
 readonly agents_dir="$HOME/Library/LaunchAgents"
 readonly agent_path="$agents_dir/$agent_label.plist"
 readonly user_domain="gui/$(/usr/bin/id -u)"
+readonly setup_mode="${1:-}"
+
+if [[ $# -gt 1 || ( -n "$setup_mode" && "$setup_mode" != "--use-existing-token" ) ]]; then
+  echo "ai-design-auth:error:unsupported-option" >&2
+  exit 2
+fi
 
 if [[ ! -x "$loader_path" ]]; then
   echo "ai-design-auth:error:loader-missing" >&2
@@ -26,16 +32,18 @@ if [[ "$loader_path" == *[\&\<\>]* ]]; then
   exit 3
 fi
 
-echo "契約者専用トークンを入力してEnterを押してください。入力内容は表示されません。"
-/usr/bin/security add-generic-password \
-  -U \
-  -a "$account_name" \
-  -s "$keychain_service" \
-  -l "AIデザインSkill web-design-pro" \
-  -w
+if [[ "$setup_mode" != "--use-existing-token" ]]; then
+  echo "契約者専用トークンを入力してEnterを押してください。入力内容は表示されません。"
+  /usr/bin/security add-generic-password \
+    -U \
+    -a "$account_name" \
+    -s "$keychain_service" \
+    -l "AIデザインSkill web-design-pro" \
+    -w
+fi
 
 if ! "$loader_path"; then
-  echo "ai-design-auth:error:invalid-token-format" >&2
+  echo "ai-design-auth:error:keychain-read-or-token-format" >&2
   exit 4
 fi
 
@@ -56,6 +64,15 @@ fi
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

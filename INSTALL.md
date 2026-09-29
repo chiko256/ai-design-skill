@@ -37,6 +37,21 @@ ai-design-auth:configured
 
 CodexをmacOSのログイン項目から自動起動している場合、LaunchAgentより先に起動すると環境変数を受け取れないことがある。その場合はCodexを完全終了して起動し直す。
 
+再起動後に接続エラーが出る場合は、次の診断を実行する。表示されるのは状態だけで、トークンの値は表示されない。
+
+```bash
+~/.codex/skills/web-design-pro/scripts/check-macos-auth.sh
+```
+
+以前の設定スクリプトで`ai-design-auth:configured`と表示されたことがある場合は、リポジトリを更新し、保存済みトークンを使ってLaunchAgentを再登録できる。
+
+```bash
+git -C ~/.codex/skills/web-design-pro pull --ff-only
+~/.codex/skills/web-design-pro/scripts/setup-macos-auth.sh --use-existing-token
+```
+
+再登録後にCodexを完全終了して起動し直す。キーチェーンの読み込みに失敗する場合だけ、引数なしのセットアップスクリプトを実行し、契約者専用トークンを本人が再入力する。
+
 `launchctl getenv WEB_DESIGN_PRO_TOKEN`をそのまま実行するとトークンが表示されるため、確認目的で実行しない。
 
 画像の透過処理を使う端末ではPython 3とPillowが必要です。

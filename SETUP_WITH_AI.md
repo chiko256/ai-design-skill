@@ -65,6 +65,8 @@ macOSでは、トークンをログインキーチェーンへ保存し、Launch
 
 設定後は、スクリプトが`ai-design-auth:configured`と表示したことを確認する。環境変数の値を確認する目的で`launchctl getenv WEB_DESIGN_PRO_TOKEN`をそのまま実行するとトークンが表示されるため、実行しない。
 
+再起動後に環境変数が見つからない場合は、利用者の端末で`scripts/check-macos-auth.sh`を実行し、秘密値を含まない診断結果を確認する。以前のセットアップスクリプトを実行済みなら、最新版へ更新したあと`scripts/setup-macos-auth.sh --use-existing-token`でLaunchAgentを再登録する。キーチェーンから読み込めない場合だけ、通常のセットアップスクリプトを実行して利用者本人にトークンを再入力してもらう。
+
 CodexがmacOSのログイン項目として自動起動され、LaunchAgentより先に起動した場合は、環境変数を受け取れないことがある。その場合はCodexを完全終了し、起動し直す。
 
 macOS以外では、OSの資格情報ストアとログイン時の起動機構を使う。トークンを`config.toml`、`.env`、シェル設定ファイルへ平文で保存しない。
