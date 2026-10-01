@@ -16,12 +16,13 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from PIL import Image
 
 REQUIRED_IMAGE_WIDTH = 1440
 REQUIRED_PROMPT_META_KEYS = {
@@ -31,15 +32,18 @@ REQUIRED_PROMPT_META_KEYS = {
     "background_zone",
     "display_text_exact",
     "special_direction",
-    "fv_expression",
+    "implementation_direction",
     "expected_output_file",
 }
-OPTIONAL_PROMPT_META_KEYS = {"combine_sections_explicit", "text_scale_profile"}
-LEGACY_PROMPT_META_KEYS = {"background", "top_background", "bottom_background"}
+OPTIONAL_PROMPT_META_KEYS = {
+    "combine_sections_explicit", "text_scale_profile", "user_instruction",
+    "background_expression_level", "decoration_level",
+}
+LEGACY_PROMPT_META_KEYS = {"background", "top_background", "bottom_background", "height_type", "target_ratio"}
 ALLOWED_PROMPT_META_KEYS = (
     REQUIRED_PROMPT_META_KEYS | OPTIONAL_PROMPT_META_KEYS | LEGACY_PROMPT_META_KEYS
 )
-ART_DIRECTION_ROLES = ("主役", "統合", "奥行き", "見せ場")
+ART_DIRECTION_REQUIRED_ROLES = ("主役", "組み合わせ方")
 DEFAULT_CONTENT_SURFACE_POLICY = "code-friendly-standard"
 ALLOWED_CONTENT_SURFACE_POLICIES = {
     "code-friendly-standard",
@@ -52,20 +56,32 @@ ALLOWED_TEXT_SCALE_PROFILES = {
     "voice-reading",
     "faq-compact",
 }
+ALLOWED_DECORATION_LEVELS = {
+    "あしらい",
+    "あしらい少し",
+    "なし",
+}
+DECORATION_PROMPT_LINES = {
+    "あしらい": "- あしらい: TOPの雰囲気に合うあしらいを、セクション内で十分な存在感で使用する。",
+    "あしらい少し": "- あしらい: TOPの雰囲気に合う小さなあしらいを、控えめに1〜2箇所だけ使用する。",
+    "なし": "- あしらい: このセクションには背景のあしらいを入れない。内容を説明する人物・UI・イラストは使用してよい。",
+}
+ALLOWED_BACKGROUND_EXPRESSION_LEVELS = {"なし", "少し", "しっかり"}
+BACKGROUND_EXPRESSION_PROMPT_LINES = {
+    "なし": "- 背景演出量: なし。指定された背景面だけを使い、背景図形・線・光・模様を追加しない。",
+    "少し": "- 背景演出量: 少し。FVと同系統の背景表現を控えめに使い、文字と内容の読みやすさを保つ。",
+    "しっかり": "- 背景演出量: しっかり。FVと同系統の背景表現を強めに使い、文字と内容の読みやすさを保つ。",
+}
 TEXT_SCALE_PROMPT_LINES = {
     "default-web": (),
     "news-compact": (
-        "- 1440px幅のPC表示換算で、日付14px、カテゴリ14px、補足・概要文14px、お知らせ見出し16pxにする。",
-        "- お知らせの件数が少なくても、余白を埋める目的で文字、行間、各項目を拡大しない。",
+        "- 文字階層: お知らせ見出しを中心に、日付・カテゴリ・概要を控えめに揃える。少ない件数を文字拡大で埋めない。",
     ),
     "voice-reading": (
-        "- 1440px幅のPC表示換算で、短い引用・カード見出し20px、本文16px、氏名14px、年代・属性13pxにする。",
-        "- 声の件数が少なくても、余白を埋める目的で引用、本文、行間、各項目を拡大しない。",
+        "- 文字階層: 引用・見出し、本文、氏名・属性の順に強弱を付け、読みやすく揃える。少ない件数を文字拡大で埋めない。",
     ),
     "faq-compact": (
-        "- 1440px幅のPC表示換算で、質問18px、回答16px、Aラベル18px、Qラベル22pxにする。",
-        "- 質問を大見出しや大きなカード見出しにせず、質問と回答をコンパクトな縦リストとして整理する。",
-        "- 質問数が少なくても、余白を埋める目的で文字、行間、各FAQ行を拡大しない。",
+        "- 文字階層: 質問と回答の強弱を揃え、コンパクトな縦リストにする。少ない件数を文字拡大で埋めない。",
     ),
 }
 STANDARD_CONTENT_SURFACE_PROHIBITION = (
@@ -106,11 +122,247 @@ NO_PHOTO_DIRECTION_PHRASES = (
     "イラストのみ",
     "イラストだけ",
 )
+
 ALLOWED_PAGE_COMMON_META_KEYS = {
-    "background_palette",
-    "background_zones",
-    "content_surface_policy",
+    "style", "background_palette", "background_zones", "content_surface_policy", "design_impression",
+    "fv_background_expression",
 }
+STYLE_REF_SCOPE = "採用FVの配色・書体・写真品質・UI・イラストの雰囲気。写真そのものやFVの構図は繰り返さない。"
+
+
+def validate_content_surface_policy(value: object) -> str:
+    policy = str(value or DEFAULT_CONTENT_SURFACE_POLICY).strip()
+    if policy not in ALLOWED_CONTENT_SURFACE_POLICIES:
+        allowed = " / ".join(sorted(ALLOWED_CONTENT_SURFACE_POLICIES))
+        fail(
+            "ページ共通計画: content_surface_policy は "
+            f"{allowed} のいずれかにしてください: {policy or '未指定'}"
+        )
+    return policy
+
+def display_text_roles(display_text: str) -> set[str]:
+    """`役割: 表示文字` から文字階層の判定に使う役割名だけを取り出す。"""
+    roles: set[str] = set()
+    for raw_line in display_text.splitlines():
+        line = re.sub(r"^\s*[-*]\s*", "", raw_line).strip()
+        if not line or (":" not in line and "：" not in line):
+            continue
+        role = re.split(r"[:：]", line, maxsplit=1)[0].strip().lower()
+        role = re.sub(r"[0-9０-９]+$", "", role)
+        if role:
+            roles.add(role)
+    return roles
+
+def format_display_text_for_prompt(display_text: str) -> str:
+    """表示値を変えず、反復項目の役割ラベルだけを個別prompt向けに明確化する。"""
+    counters: dict[str, int] = {}
+    output: list[str] = []
+    paired_roles = {"項目", "機能", "導線", "カード"}
+    numbered_roles = {"ボタン", "手順", "紹介", "お知らせ"}
+
+    for raw_line in display_text.splitlines():
+        line = raw_line.strip()
+        if not line or (":" not in line and "：" not in line):
+            if line:
+                output.append(line)
+            continue
+        role, value = re.split(r"[:：]", line, maxsplit=1)
+        role = role.strip()
+        value = value.strip()
+        role_key = role.lower()
+
+        if role_key in {"q", "質問"}:
+            counters["qa_question"] = counters.get("qa_question", 0) + 1
+            output.append(f"Q{counters['qa_question']}: {value}")
+            continue
+        if role_key in {"a", "回答"}:
+            counters["qa_answer"] = counters.get("qa_answer", 0) + 1
+            output.append(f"A{counters['qa_answer']}: {value}")
+            continue
+
+        if role in paired_roles:
+            counters[role] = counters.get(role, 0) + 1
+            index = counters[role]
+            parts = re.split(r"\s+[—–]\s+", value, maxsplit=1)
+            if len(parts) == 1:
+                parts = re.split(r"[:：]", value, maxsplit=1)
+            if len(parts) == 2 and all(part.strip() for part in parts):
+                output.append(f"{role}{index}見出し: {parts[0].strip()}")
+                output.append(f"{role}{index}本文: {parts[1].strip()}")
+            else:
+                output.append(f"{role}{index}: {value}")
+            continue
+
+        if role in numbered_roles:
+            counters[role] = counters.get(role, 0) + 1
+            index = counters[role]
+            if role == "お知らせ":
+                match = re.fullmatch(r"(\d{4}\.\d{2}\.\d{2})\s+(.+)", value)
+                if match:
+                    output.append(f"お知らせ{index}日付: {match.group(1)}")
+                    output.append(f"お知らせ{index}本文: {match.group(2)}")
+                    continue
+            output.append(f"{role}{index}: {value}")
+            continue
+
+        output.append(f"{role}: {value}")
+
+    return "\n".join(output)
+
+def has_faq_text_hierarchy(display_text: str) -> bool:
+    roles = display_text_roles(display_text)
+    has_question = bool(roles & {"q", "質問"})
+    has_answer = bool(roles & {"a", "回答"})
+    return has_question and has_answer
+
+def inferred_text_scale_profile(item: dict) -> str:
+    """セクション名と表示役割から旧入力の文字スケールを補完する。"""
+    meta = item["meta"]
+    display_text = str(meta.get("display_text_exact", ""))
+    label = " ".join(
+        [str(item.get("title", "")), *[str(value) for value in meta.get("target_sections", [])]]
+    ).lower()
+    if has_faq_text_hierarchy(display_text) or re.search(r"\bfaq\b|よくある質問", label):
+        return "faq-compact"
+    if re.search(r"\bnews\b|お知らせ|新着情報", label):
+        return "news-compact"
+    if re.search(
+        r"(?:お客様|お客さん|患者(?:さま|様)?|利用者|受講者|宿泊者|先輩移住者|ユーザー).*声|体験談|testimonials?|\bvoice\b",
+        label,
+    ):
+        return "voice-reading"
+    return DEFAULT_TEXT_SCALE_PROFILE
+
+def validate_text_scale_profile(item: dict) -> str:
+    """文字スケールプロファイルを検証し、旧入力ではセクション種別から補完する。"""
+    num = int(item["num"])
+    meta = item["meta"]
+    inferred = inferred_text_scale_profile(item)
+    raw = str(meta.get("text_scale_profile", "")).strip()
+    profile = raw or inferred
+    if profile not in ALLOWED_TEXT_SCALE_PROFILES:
+        allowed = " / ".join(sorted(ALLOWED_TEXT_SCALE_PROFILES))
+        fail(
+            f"プロンプト{num}: text_scale_profile は {allowed} のいずれかにしてください: "
+            f"{profile or '未指定'}"
+        )
+    if inferred != DEFAULT_TEXT_SCALE_PROFILE and profile != inferred:
+        fail(
+            f"プロンプト{num}: このセクションの text_scale_profile は "
+            f"{inferred} にしてください: {profile}"
+        )
+    meta["text_scale_profile"] = profile
+    return profile
+
+def forbids_icons(special_direction: str) -> bool:
+    normalized = normalize_text(special_direction)
+    return any(
+        phrase in normalized
+        for phrase in ("アイコンを使わない", "アイコンは使わない", "アイコンなし")
+    )
+
+def forbids_photo(special_direction: str) -> bool:
+    """簡易アートディレクションに明示的な写真禁止があるか判定する。"""
+    normalized = normalize_text(special_direction)
+    return any(phrase in normalized for phrase in NO_PHOTO_DIRECTION_PHRASES)
+
+def validate_special_direction(value: object, num: int) -> str:
+    """簡易アートディレクションを固定スキーマへ正規化する。"""
+    if not isinstance(value, str) or not value.strip():
+        fail(f"プロンプト{num}: special_direction が空です")
+
+    parsed: dict[str, str] = {}
+    allowed_roles = {*ART_DIRECTION_REQUIRED_ROLES, "特別な演出"}
+    for raw_line in value.splitlines():
+        line = re.sub(r"^\s*[-*]\s*", "", raw_line).strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"([^:：]+)\s*[:：]\s*(.+)", line)
+        if not match:
+            fail(
+                f"プロンプト{num}: special_direction は "
+                "`主役 / 組み合わせ方` と任意の `特別な演出` だけで記録してください: "
+                f"{line}"
+            )
+        role, direction = match.group(1).strip(), match.group(2).strip()
+        if role in {"奥行き", "見せ場"}:  # 保存済み計画から読み込んでも新しいpromptへ転記しない。
+            continue
+        if role == "統合":  # 保存済み計画の旧項目名。
+            role = "組み合わせ方"
+        if role not in allowed_roles:
+            fail(f"プロンプト{num}: special_direction に未許可の項目があります: {role}")
+        if role in parsed:
+            fail(f"プロンプト{num}: special_direction の項目が重複しています: {role}")
+        if len(direction) > 160:
+            fail(f"プロンプト{num}: special_direction の `{role}` は160文字以内にしてください")
+        if re.search(r"```|`?(?:source_text_exact|target_sections|expected_output_file|section_purpose)`?", direction):
+            fail(f"プロンプト{num}: special_direction の `{role}` に管理メタを入れないでください")
+        if re.search(r"\b\d+(?:\.\d+)?\s*px\b|\b(?:x|y)\s*=|\d+\s*カラム|カード幅|余白量|左右比率", direction, re.IGNORECASE):
+            fail(f"プロンプト{num}: special_direction の `{role}` に詳細レイアウト指定を入れないでください")
+        parsed[role] = direction
+
+    missing = [role for role in ART_DIRECTION_REQUIRED_ROLES if role not in parsed]
+    if missing:
+        fail(
+            f"プロンプト{num}: special_direction に簡易アートディレクションの必須2項目が不足しています: "
+            + ", ".join(missing)
+        )
+
+    normalized = [f"{role}: {parsed[role]}" for role in ART_DIRECTION_REQUIRED_ROLES]
+    if "特別な演出" in parsed and normalize_text(parsed["特別な演出"]) != "なし":
+        normalized.append(f"特別な演出: {parsed['特別な演出']}")
+    return "\n".join(normalized)
+
+def validate_content_surface_compatibility(
+    special_direction: str,
+    policy: str,
+    num: int,
+    field: str = "special_direction",
+) -> None:
+    """簡易アートディレクションとページ共通の実装方針の矛盾を止める。"""
+    if policy != "code-friendly-standard":
+        return
+    normalized = normalize_text(special_direction)
+    conflicts = [
+        pattern
+        for pattern in CONTENT_SURFACE_CONFLICT_PATTERNS
+        if re.search(pattern, normalized)
+    ]
+    if conflicts:
+        fail(
+            f"プロンプト{num}: {field} が content_surface_policy=code-friendly-standard "
+            "と矛盾しています。紙・布・水彩の表面テクスチャ、破れた縁、不規則な輪郭を除くか、"
+            "ユーザーの明示指定がある場合だけ texture-asset-explicit を選んでください"
+        )
+
+def validate_implementation_independence(special_direction: str, num: int, field: str = "special_direction") -> None:
+    """複数要素の描き直しを前提にする視覚統合を生成前に止める。"""
+    normalized = normalize_text(special_direction)
+    has_material = IMPLEMENTATION_DEPENDENCY_MATERIAL_PATTERN.search(normalized)
+    has_action = IMPLEMENTATION_DEPENDENCY_ACTION_PATTERN.search(normalized)
+    has_exemption = IMPLEMENTATION_INDEPENDENCE_EXEMPTION_PATTERN.search(normalized)
+    if has_material and has_action and not has_exemption:
+        fail(
+            f"プロンプト{num}: {field} が実装独立性と矛盾しています。"
+            "線・マスク・切り抜き・装飾・合成・コラージュで複数要素を一体化せず、"
+            "共通色・書体・文字階層・輪郭・アイコン・余白・反復規則・背景面で関係づけるか、"
+            "1要素内で完結する装飾または位置に依存しない独立素材として明示してください"
+        )
+
+def decoration_prompt_line(decoration_level: str, protected_edge: str | None) -> str:
+    """旧計画のあしらい量を生成文へ渡す。"""
+    base = DECORATION_PROMPT_LINES[decoration_level]
+    if protected_edge is None:
+        return base
+    return (
+        f"{base} 接続する{protected_edge}から離し、"
+        "あしらいはすべて画像内で完結させる。"
+    )
+
+
+def background_expression_prompt_line(level: str) -> str:
+    """FVに背景演出がある新規計画だけで使う。"""
+    return BACKGROUND_EXPRESSION_PROMPT_LINES[level]
 
 
 def fail(message: str) -> None:
@@ -124,10 +376,6 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def shell_join(parts: list[str]) -> str:
-    return " ".join(shlex.quote(part) for part in parts)
 
 
 def png_dimensions(path: Path) -> tuple[int, int]:
@@ -146,8 +394,7 @@ def normalize_png_width(path: Path, required_width: int = REQUIRED_IMAGE_WIDTH) 
         return
     sips = shutil.which("sips")
     if not sips:
-        print(f"WARNING: {path} の横幅が {width}px です。{required_width}pxへ補正するための sips が見つからないため、Issues に記録してください。", file=sys.stderr)
-        return
+        fail(f"{path} の横幅が {width}px です。{required_width}pxへ補正するための sips が見つかりません")
     new_height = max(1, round(height * required_width / width))
     result = subprocess.run(
         [sips, "-z", str(new_height), str(required_width), str(path)],
@@ -157,16 +404,28 @@ def normalize_png_width(path: Path, required_width: int = REQUIRED_IMAGE_WIDTH) 
         check=False,
     )
     if result.returncode != 0:
-        print(f"WARNING: {path} を横幅{required_width}pxへ補正できませんでした。Issues に記録してください。\n{result.stderr.strip()}", file=sys.stderr)
-        return
+        fail(f"{path} を横幅{required_width}pxへ補正できませんでした。\n{result.stderr.strip()}")
     normalized_width, _ = png_dimensions(path)
     if normalized_width != required_width:
-        print(f"WARNING: {path} の横幅補正後チェックに失敗しました: {normalized_width}px。Issues に記録してください。", file=sys.stderr)
+        fail(f"{path} の横幅補正後チェックに失敗しました: {normalized_width}px")
+    try:
+        with Image.open(path) as normalized:
+            normalized.load()
+    except (OSError, ValueError) as exc:
+        fail(f"横幅補正後の画像を読み取れません: {path}: {exc}")
 
 
 def normalize_text(value: str) -> str:
     """検証用に空白差分を吸収する。"""
     return re.sub(r"\s+", "", value or "")
+
+
+def normalize_background(value: str) -> str:
+    """単色HEXは説明文によらず同一視し、グラデーションの方向は保持する。"""
+    colors = re.findall(r"#[0-9a-fA-F]{6}\b", value)
+    if len(colors) == 1 and not re.search(r"グラデーション|gradient", value, re.I):
+        return colors[0].lower()
+    return normalize_text(value).lower()
 
 
 def parse_yaml_meta(raw: str) -> dict:
@@ -246,15 +505,19 @@ def validate_background_id(value: str, label: str) -> str:
     return value
 
 
-def validate_content_surface_policy(value: object) -> str:
-    policy = str(value or DEFAULT_CONTENT_SURFACE_POLICY).strip()
-    if policy not in ALLOWED_CONTENT_SURFACE_POLICIES:
-        allowed = " / ".join(sorted(ALLOWED_CONTENT_SURFACE_POLICIES))
-        fail(
-            "ページ共通計画: content_surface_policy は "
-            f"{allowed} のいずれかにしてください: {policy or '未指定'}"
-        )
-    return policy
+def validate_style(value: object) -> str:
+    """旧計画の観察記録を保持する。個別promptには出さない。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        fail("ページ共通計画: style は文字列で記録してください")
+    return " ".join(value.split())
+
+
+def spacing_prompt_line(impression: str) -> str:
+    if impression.strip() in {"力強い", "賑やか", "にぎやか"}:
+        return "- 余白: トレンド感ある余白に。"
+    return "- 余白: たっぷり余白を使ったデザインに。"
 
 
 def extract_background_plan(input_md: Path) -> dict | None:
@@ -264,6 +527,14 @@ def extract_background_plan(input_md: Path) -> dict | None:
     if not match:
         return None
     meta = parse_yaml_meta(match.group(1))
+    impression = meta.get("design_impression", "")
+    if not isinstance(impression, str) or ("design_impression" in meta and not impression.strip()):
+        fail("ページ共通計画: design_impression に主となるデザインの印象を1つ記録してください")
+    fv_background_expression = meta.get("fv_background_expression")
+    if fv_background_expression is not None:
+        if not isinstance(fv_background_expression, str) or fv_background_expression.strip() not in {"あり", "なし"}:
+            fail("ページ共通計画: fv_background_expression は あり / なし のいずれかにしてください")
+        fv_background_expression = fv_background_expression.strip()
     unknown = sorted(set(meta) - ALLOWED_PAGE_COMMON_META_KEYS)
     if unknown:
         fail(
@@ -327,9 +598,10 @@ def extract_background_plan(input_md: Path) -> dict | None:
     return {
         "palette": palette,
         "zones": zones,
-        "content_surface_policy": validate_content_surface_policy(
-            meta.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)
-        ),
+        "style": validate_style(meta.get("style")),
+        "design_impression": impression.strip(),
+        "content_surface_policy": validate_content_surface_policy(meta.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)),
+        **({"fv_background_expression": fv_background_expression} if fv_background_expression is not None else {}),
     }
 
 
@@ -374,7 +646,7 @@ def legacy_background_plan(prompts: list[dict]) -> dict:
     return {
         "palette": palette,
         "zones": zones,
-        "content_surface_policy": DEFAULT_CONTENT_SURFACE_POLICY,
+        "style": "",
     }
 
 
@@ -437,252 +709,18 @@ def display_text_values(display_text: str) -> list[str]:
         if ":" in line or "：" in line:
             parts = re.split(r"[:：]", line, maxsplit=1)
             line = parts[1].strip()
-        line = line.strip().strip("`").strip('"').strip("'").strip()
+        line = line.strip()
         if line:
             values.append(line)
     return values
-
-
-def display_text_roles(display_text: str) -> set[str]:
-    """`役割: 表示文字` から文字階層の判定に使う役割名だけを取り出す。"""
-    roles: set[str] = set()
-    for raw_line in display_text.splitlines():
-        line = re.sub(r"^\s*[-*]\s*", "", raw_line).strip()
-        if not line or (":" not in line and "：" not in line):
-            continue
-        role = re.split(r"[:：]", line, maxsplit=1)[0].strip().lower()
-        role = re.sub(r"[0-9０-９]+$", "", role)
-        if role:
-            roles.add(role)
-    return roles
-
-
-def format_display_text_for_prompt(display_text: str) -> str:
-    """表示値を変えず、反復項目の役割ラベルだけを個別prompt向けに明確化する。"""
-    counters: dict[str, int] = {}
-    output: list[str] = []
-    paired_roles = {"項目", "機能", "導線", "カード"}
-    numbered_roles = {"ボタン", "手順", "紹介", "お知らせ"}
-
-    for raw_line in display_text.splitlines():
-        line = raw_line.strip()
-        if not line or (":" not in line and "：" not in line):
-            if line:
-                output.append(line)
-            continue
-        role, value = re.split(r"[:：]", line, maxsplit=1)
-        role = role.strip()
-        value = value.strip()
-        role_key = role.lower()
-
-        if role_key in {"q", "質問"}:
-            counters["qa_question"] = counters.get("qa_question", 0) + 1
-            output.append(f"Q{counters['qa_question']}: {value}")
-            continue
-        if role_key in {"a", "回答"}:
-            counters["qa_answer"] = counters.get("qa_answer", 0) + 1
-            output.append(f"A{counters['qa_answer']}: {value}")
-            continue
-
-        if role in paired_roles:
-            counters[role] = counters.get(role, 0) + 1
-            index = counters[role]
-            parts = re.split(r"\s+[—–]\s+", value, maxsplit=1)
-            if len(parts) == 1:
-                parts = re.split(r"[:：]", value, maxsplit=1)
-            if len(parts) == 2 and all(part.strip() for part in parts):
-                output.append(f"{role}{index}見出し: {parts[0].strip()}")
-                output.append(f"{role}{index}本文: {parts[1].strip()}")
-            else:
-                output.append(f"{role}{index}: {value}")
-            continue
-
-        if role in numbered_roles:
-            counters[role] = counters.get(role, 0) + 1
-            index = counters[role]
-            if role == "お知らせ":
-                match = re.fullmatch(r"(\d{4}\.\d{2}\.\d{2})\s+(.+)", value)
-                if match:
-                    output.append(f"お知らせ{index}日付: {match.group(1)}")
-                    output.append(f"お知らせ{index}本文: {match.group(2)}")
-                    continue
-            output.append(f"{role}{index}: {value}")
-            continue
-
-        output.append(f"{role}: {value}")
-
-    return "\n".join(output)
-
-
-def has_faq_text_hierarchy(display_text: str) -> bool:
-    roles = display_text_roles(display_text)
-    has_question = bool(roles & {"q", "質問"})
-    has_answer = bool(roles & {"a", "回答"})
-    return has_question and has_answer
-
-
-def inferred_text_scale_profile(item: dict) -> str:
-    """セクション名と表示役割から旧入力の文字スケールを補完する。"""
-    meta = item["meta"]
-    display_text = str(meta.get("display_text_exact", ""))
-    label = " ".join(
-        [str(item.get("title", "")), *[str(value) for value in meta.get("target_sections", [])]]
-    ).lower()
-    if has_faq_text_hierarchy(display_text) or re.search(r"\bfaq\b|よくある質問", label):
-        return "faq-compact"
-    if re.search(r"\bnews\b|お知らせ|新着情報", label):
-        return "news-compact"
-    if re.search(
-        r"(?:お客様|お客さん|患者(?:さま|様)?|利用者|受講者|宿泊者|先輩移住者|ユーザー).*声|体験談|testimonials?|\bvoice\b",
-        label,
-    ):
-        return "voice-reading"
-    return DEFAULT_TEXT_SCALE_PROFILE
-
-
-def validate_text_scale_profile(item: dict) -> str:
-    """文字スケールプロファイルを検証し、旧入力ではセクション種別から補完する。"""
-    num = int(item["num"])
-    meta = item["meta"]
-    inferred = inferred_text_scale_profile(item)
-    raw = str(meta.get("text_scale_profile", "")).strip()
-    profile = raw or inferred
-    if profile not in ALLOWED_TEXT_SCALE_PROFILES:
-        allowed = " / ".join(sorted(ALLOWED_TEXT_SCALE_PROFILES))
-        fail(
-            f"プロンプト{num}: text_scale_profile は {allowed} のいずれかにしてください: "
-            f"{profile or '未指定'}"
-        )
-    if inferred != DEFAULT_TEXT_SCALE_PROFILE and profile != inferred:
-        fail(
-            f"プロンプト{num}: このセクションの text_scale_profile は "
-            f"{inferred} にしてください: {profile}"
-        )
-    meta["text_scale_profile"] = profile
-    return profile
-
-
-def forbids_icons(special_direction: str) -> bool:
-    normalized = normalize_text(special_direction)
-    return any(
-        phrase in normalized
-        for phrase in ("アイコンを使わない", "アイコンは使わない", "アイコンなし")
-    )
-
-
-def validate_fv_expression(value: object, num: int) -> str:
-    """工程05が選んだ特徴を受け取り、欠落を非対象と解釈しない。"""
-    if not isinstance(value, str) or not value.strip():
-        fail(f"プロンプト{num}: fv_expression に具体的な特徴または `なし` を記録してください")
-    value = value.strip()
-    if len(value) > 160 or len(value.splitlines()) != 1:
-        fail(f"プロンプト{num}: fv_expression は1行・160文字以内にしてください")
-    if re.search(r"```|`?(?:source_text_exact|target_sections|expected_output_file|section_purpose)`?", value):
-        fail(f"プロンプト{num}: fv_expression に管理メタを入れないでください")
-    if re.search(r"\d+(?:\.\d+)?\s*px|(?:x|y)\s*=|\d+\s*カラム|カード幅|余白量|左右比率", value, re.IGNORECASE):
-        fail(f"プロンプト{num}: fv_expression に詳細レイアウト指定を入れないでください")
-    return value
-
-
-def forbids_photo(special_direction: str) -> bool:
-    """簡易アートディレクションに明示的な写真禁止があるか判定する。"""
-    normalized = normalize_text(special_direction)
-    return any(phrase in normalized for phrase in NO_PHOTO_DIRECTION_PHRASES)
-
-
-def validate_special_direction(value: object, num: int) -> str:
-    """簡易アートディレクションを固定スキーマへ正規化する。"""
-    if not isinstance(value, str) or not value.strip():
-        fail(f"プロンプト{num}: special_direction が空です")
-
-    parsed: dict[str, str] = {}
-    allowed_roles = {*ART_DIRECTION_ROLES, "特別な演出"}
-    for raw_line in value.splitlines():
-        line = re.sub(r"^\s*[-*]\s*", "", raw_line).strip()
-        if not line:
-            continue
-        match = re.fullmatch(r"([^:：]+)\s*[:：]\s*(.+)", line)
-        if not match:
-            fail(
-                f"プロンプト{num}: special_direction は "
-                "`主役 / 統合 / 奥行き / 見せ場` と任意の `特別な演出` だけで記録してください: "
-                f"{line}"
-            )
-        role, direction = match.group(1).strip(), match.group(2).strip()
-        if role not in allowed_roles:
-            fail(f"プロンプト{num}: special_direction に未許可の項目があります: {role}")
-        if role in parsed:
-            fail(f"プロンプト{num}: special_direction の項目が重複しています: {role}")
-        if len(direction) > 160:
-            fail(f"プロンプト{num}: special_direction の `{role}` は160文字以内にしてください")
-        if re.search(r"```|`?(?:source_text_exact|target_sections|expected_output_file|section_purpose)`?", direction):
-            fail(f"プロンプト{num}: special_direction の `{role}` に管理メタを入れないでください")
-        if re.search(r"\b\d+(?:\.\d+)?\s*px\b|\b(?:x|y)\s*=|\d+\s*カラム|カード幅|余白量|左右比率", direction, re.IGNORECASE):
-            fail(f"プロンプト{num}: special_direction の `{role}` に詳細レイアウト指定を入れないでください")
-        parsed[role] = direction
-
-    missing = [role for role in ART_DIRECTION_ROLES if role not in parsed]
-    if missing:
-        fail(
-            f"プロンプト{num}: special_direction に簡易アートディレクション4項目が不足しています: "
-            + ", ".join(missing)
-        )
-
-    normalized = [f"{role}: {parsed[role]}" for role in ART_DIRECTION_ROLES]
-    if "特別な演出" in parsed and normalize_text(parsed["特別な演出"]) != "なし":
-        normalized.append(f"特別な演出: {parsed['特別な演出']}")
-    return "\n".join(normalized)
-
-
-def validate_content_surface_compatibility(
-    special_direction: str,
-    policy: str,
-    num: int,
-    field_name: str = "special_direction",
-) -> None:
-    """簡易アートディレクションとページ共通の実装方針の矛盾を止める。"""
-    if policy != "code-friendly-standard":
-        return
-    normalized = normalize_text(special_direction)
-    conflicts = [
-        pattern
-        for pattern in CONTENT_SURFACE_CONFLICT_PATTERNS
-        if re.search(pattern, normalized)
-    ]
-    if conflicts:
-        fail(
-            f"プロンプト{num}: {field_name} が content_surface_policy=code-friendly-standard "
-            "と矛盾しています。紙・布・水彩の表面テクスチャ、破れた縁、不規則な輪郭を除くか、"
-            "ユーザーの明示指定がある場合だけ texture-asset-explicit を選んでください"
-        )
-
-
-def validate_implementation_independence(
-    special_direction: str, num: int, field_name: str = "special_direction"
-) -> None:
-    """複数要素の描き直しを前提にする視覚統合を生成前に止める。"""
-    normalized = normalize_text(special_direction)
-    has_material = IMPLEMENTATION_DEPENDENCY_MATERIAL_PATTERN.search(normalized)
-    has_action = IMPLEMENTATION_DEPENDENCY_ACTION_PATTERN.search(normalized)
-    has_exemption = IMPLEMENTATION_INDEPENDENCE_EXEMPTION_PATTERN.search(normalized)
-    if has_material and has_action and not has_exemption:
-        fail(
-            f"プロンプト{num}: {field_name} が実装独立性と矛盾しています。"
-            "線・マスク・切り抜き・装飾・合成・コラージュで複数要素を一体化せず、"
-            "共通色・書体・文字階層・輪郭・アイコン・余白・反復規則・背景面で関係づけるか、"
-            "1要素内で完結する装飾または位置に依存しない独立素材として明示してください"
-        )
-
-
-def normalize_background(value: object) -> str:
-    return normalize_text(str(value).replace("`", "")).lower()
 
 
 def validate_prompt_meta(
     prompts: list[dict],
     project_dir: Path,
     page: str,
-    content_surface_policy: str,
+    content_surface_policy: str = DEFAULT_CONTENT_SURFACE_POLICY,
+    fv_background_expression: str | None = None,
 ) -> None:
     texts_path = project_dir / "texts.md"
     if not texts_path.exists():
@@ -717,7 +755,7 @@ def validate_prompt_meta(
             fail(f"プロンプト{num}: source_text_exact が空です")
         if normalize_text(source_text) not in texts_content:
             fail(f"プロンプト{num}: source_text_exact が texts.md に見つかりません")
-        for key in ["section_purpose", "background_zone", "display_text_exact"]:
+        for key in ["section_purpose", "background_zone", "display_text_exact", "implementation_direction"]:
             value = meta[key]
             if not isinstance(value, str) or not value.strip():
                 fail(f"プロンプト{num}: {key} が空です")
@@ -726,22 +764,42 @@ def validate_prompt_meta(
         if not visible_values:
             fail(f"プロンプト{num}: display_text_exact に表示文字がありません")
         normalized_source = normalize_text(str(source_text))
+        source_cursor = 0
         for visible_value in visible_values:
-            if normalize_text(visible_value) not in normalized_source:
+            normalized_value = normalize_text(visible_value)
+            position = normalized_source.find(normalized_value, source_cursor)
+            if position < 0:
                 fail(
-                    f"プロンプト{num}: display_text_exact の値が source_text_exact に見つかりません: {visible_value}"
+                    f"プロンプト{num}: display_text_exact の値が source_text_exact に原稿順で見つかりません: {visible_value}"
                 )
+            source_cursor = position + len(normalized_value)
+        user_instruction = meta.get("user_instruction", "")
+        if not isinstance(user_instruction, str):
+            fail(f"プロンプト{num}: user_instruction はユーザーの個別指定を短い文字列で記録してください")
+        meta["user_instruction"] = " ".join(user_instruction.split())
         validate_text_scale_profile(item)
+        if fv_background_expression == "あり":
+            if "decoration_level" in meta:
+                fail(f"プロンプト{num}: 新規計画では decoration_level を使わず background_expression_level を指定してください")
+            level = str(meta.get("background_expression_level", "")).strip()
+            if level not in ALLOWED_BACKGROUND_EXPRESSION_LEVELS:
+                fail(f"プロンプト{num}: background_expression_level は なし / 少し / しっかり のいずれかにしてください")
+            meta["background_expression_level"] = level
+        elif fv_background_expression == "なし":
+            if "background_expression_level" in meta or "decoration_level" in meta:
+                fail(f"プロンプト{num}: FV背景演出なしの場合、背景演出量を記録しないでください")
+        else:
+            if "background_expression_level" in meta:
+                fail(f"プロンプト{num}: background_expression_level にはページ共通計画の fv_background_expression が必要です")
+            decoration = str(meta.get("decoration_level", "")).strip()
+            if decoration not in ALLOWED_DECORATION_LEVELS:
+                fail(f"プロンプト{num}: 旧計画の decoration_level が不正です: {decoration}")
+            meta["decoration_level"] = decoration
         meta["special_direction"] = validate_special_direction(meta["special_direction"], num)
-        meta["fv_expression"] = validate_fv_expression(meta["fv_expression"], num)
-        validate_content_surface_compatibility(
-            str(meta["special_direction"]), content_surface_policy, num
-        )
-        validate_implementation_independence(str(meta["special_direction"]), num)
-        validate_content_surface_compatibility(
-            meta["fv_expression"], content_surface_policy, num, "fv_expression"
-        )
-        validate_implementation_independence(meta["fv_expression"], num, "fv_expression")
+        validate_content_surface_compatibility(meta["special_direction"], content_surface_policy, num)
+        validate_implementation_independence(meta["special_direction"], num)
+        validate_content_surface_compatibility(meta["implementation_direction"], content_surface_policy, num, "implementation_direction")
+        validate_implementation_independence(meta["implementation_direction"], num, "implementation_direction")
         expected_output_file = validate_expected_output_file(meta["expected_output_file"], page, num)
         if expected_output_file in expected_files:
             fail(f"プロンプト{num}: expected_output_file が重複しています: {expected_output_file}")
@@ -853,7 +911,7 @@ def write_revision_tasks(
     """revision-request.md から、対象mock-upだけの再生成タスクを作る。"""
     if quality != "high":
         fail("工程06の正式mock-up修正は --quality high だけを使用してください")
-    base = Path(project_dir)
+    base = Path(project_dir).resolve()
     revision_md = Path(revision_file) if revision_file else base / "_src" / page / "revision-request.md"
     out_dir = base / "mockups" / page
     task_dir = base / "_imagegen" / page
@@ -876,6 +934,9 @@ def write_revision_tasks(
     missing = [target for target in targets if not target.exists()]
     if missing:
         fail("対象mock-up画像が見つかりませんでした\n" + "\n".join(f"- {target}" for target in missing))
+
+    selected_fv_image = extract_selected_fv_image(base)
+    generation_log = task_dir / "generation-log.jsonl"
 
     backup_dir.mkdir(parents=True, exist_ok=True)
 
@@ -901,10 +962,14 @@ def write_revision_tasks(
             backup_file = backup_dir / f"{target.stem}_before_{timestamp}_{counter}{target.suffix}"
             counter += 1
         shutil.copy2(target, backup_file)
+        image_input_parameters = {
+            "referenced_image_paths": [str(backup_file), str(selected_fv_image)]
+        }
 
         final_prompt = "\n\n".join(
             [
-                f"添付された対象mock-up画像 `{target}` をベースにしてください。",
+                f"1枚目の参照画像 `{backup_file}` は修正前の対象mock-upです。これをベースにしてください。",
+                f"2枚目の参照画像 `{selected_fv_image}` は採用FVです。共通スタイルだけを参照してください。",
                 "対象外のセクションや画像は変更しないでください。",
                 "修正後の画像は expected_output のパスへ保存し、同じ位置のmock-upとして差し替えてください。",
                 f"修正後のPNGは横幅{REQUIRED_IMAGE_WIDTH}pxを目安にしてください。レイアウトは1440px幅のWebセクションとして扱い、横に広い別レイアウトにはしないでください。",
@@ -920,9 +985,12 @@ def write_revision_tasks(
                     f"- expected_output: `{target}`",
                     f"- reference_image: `{target}`",
                     f"- backup_image: `{backup_file}`",
-                    "- style_ref: なし",
-                    "- style_ref_attachment_required: no",
-                    "- style_ref_attachment_status: not_required",
+                    f"- style_ref: `{selected_fv_image}`",
+                    "- style_ref_attachment_required: yes",
+                    "- style_ref_attachment_status: pending",
+                    "- generation_surface: codex-app-imagegen",
+                    f"- image_input_parameters: `{json.dumps(image_input_parameters, ensure_ascii=False)}`",
+                    f"- generation_log: `{generation_log}`",
                     f"- required_image_width: {REQUIRED_IMAGE_WIDTH}px",
                     "- revision_request: `" + str(revision_md) + "`",
                     "",
@@ -951,6 +1019,10 @@ def write_revision_tasks(
                 "expected_output": str(target),
                 "reference_image": str(target),
                 "backup_image": str(backup_file),
+                "style_ref": str(selected_fv_image),
+                "generation_surface": "codex-app-imagegen",
+                "image_input_parameters": image_input_parameters,
+                "generation_log": str(generation_log),
                 "revision_request": str(revision_md),
             }
         )
@@ -962,6 +1034,9 @@ def write_revision_tasks(
                 f"- expected_output: `{target}`",
                 f"- reference_image: `{target}`",
                 f"- backup_image: `{backup_file}`",
+                f"- style_ref: `{selected_fv_image}`",
+                f"- image_input_parameters: `{json.dumps(image_input_parameters, ensure_ascii=False)}`",
+                f"- generation_log: `{generation_log}`",
                 "",
             ]
         )
@@ -975,7 +1050,7 @@ def write_revision_tasks(
     print("✅ 修正画像生成タスクを作成しました（API未使用）")
     print(f"   修正キュー: {task_dir / 'revision-queue.md'}")
     print(f"   対象画像: {len(targets)}件")
-    print("   次は Codex上の画像生成に各 revision-task-*.md のプロンプトを渡してください。")
+    print("   次は同じアプリ内担当が各修正プロンプトとimage_input_parametersを画像生成ツールへ1本ずつ渡してください。")
 
     print("   修正画像を保存後、--preview-only で通常 manifest 順の full_preview.html を更新してください。")
     if open_output:
@@ -995,182 +1070,116 @@ def background_zone_details(background_plan: dict, zone_id: str) -> tuple[str, s
     return str(zone["palette_id"]), str(palette["value"]), str(zone["treatment"])
 
 
-def same_zone_edge_prompt_lines(
-    sections: list[dict],
-    index: int,
-    background_plan: dict | None = None,
-) -> list[str]:
-    """同じゾーンIDまたは背景色へ接する上下端の保護指示を返す。"""
-    zone_palette_by_id = (
-        {
-            str(zone["id"]): str(zone["palette_id"])
-            for zone in background_plan["zones"]
-        }
-        if background_plan is not None
-        else {}
-    )
+def same_background_edges(sections: list[dict], index: int, background_plan: dict) -> tuple[bool, bool]:
+    """ゾーン名ではなく、隣接するページ背景で接続辺を決める。"""
+    def key(section: dict) -> str:
+        palette_id, value, _ = background_zone_details(background_plan, section["background_zone"])
+        return normalize_background(value) or palette_id
+    current = key(sections[index])
+    return (index > 0 and key(sections[index - 1]) == current,
+            index + 1 < len(sections) and key(sections[index + 1]) == current)
 
-    def shares_base_background(first: dict, second: dict) -> bool:
-        first_zone = str(first["background_zone"])
-        second_zone = str(second["background_zone"])
-        if first_zone == second_zone:
-            return True
-        first_palette = zone_palette_by_id.get(first_zone) or str(
-            first.get("palette_id", "")
-        )
-        second_palette = zone_palette_by_id.get(second_zone) or str(
-            second.get("palette_id", "")
-        )
-        return bool(first_palette) and first_palette == second_palette
 
-    current = sections[index]
-    same_top = index > 0 and shares_base_background(sections[index - 1], current)
-    same_bottom = index + 1 < len(sections) and shares_base_background(
-        current, sections[index + 1]
-    )
+def same_zone_edge_prompt_lines(sections: list[dict], index: int, background_plan: dict) -> list[str]:
+    same_top, same_bottom = same_background_edges(sections, index, background_plan)
     if not same_top and not same_bottom:
         return []
-    edge = "上端・下端" if same_top and same_bottom else "上端" if same_top else "下端"
-    return [
-        f"- 接続する{edge}には全幅で背景だけの余白を残し、文字・写真・装飾・影・光を入れない。",
-    ]
+    edge = "上端と下端" if same_top and same_bottom else "上端" if same_top else "下端"
+    neighbor = "前のセクションの下端と次のセクションの上端" if same_top and same_bottom else "前のセクションの下端" if same_top else "次のセクションの上端"
+    _, background, _ = background_zone_details(background_plan, sections[index]["background_zone"])
+    line = (f"- {edge}までページ背景の {background} をそのまま続ける。"
+            f"写真・文字・カード・装飾・影・区切り線は{edge}にかけない。"
+            f"{neighbor}も同じ背景にし、上下に並べたとき、一続きの背景に見えるようにする。")
+    if re.search(r"グラデーション|gradient|→", background, re.I):
+        line += " グラデーションは接続位置の色と方向を合わせ、境界で色や明るさをリセットしない。"
+    return [line]
 
 
 def build_individual_prompt(
-    selected_fv_image: Path,
     background_plan: dict,
     item: dict,
     same_zone_edge_lines: list[str] | None = None,
+    *,
+    section_start: int,
 ) -> str:
-    palette_id, palette_value, zone_treatment = background_zone_details(
-        background_plan, str(item["background_zone"])
-    )
+    _, palette_value, _ = background_zone_details(background_plan, str(item["background_zone"]))
     content_surface_policy = validate_content_surface_policy(
         background_plan.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)
     )
-    text_scale_profile = str(
-        item.get("text_scale_profile", DEFAULT_TEXT_SCALE_PROFILE)
-    ).strip()
+    text_scale_profile = str(item.get("text_scale_profile", DEFAULT_TEXT_SCALE_PROFILE)).strip()
     if text_scale_profile not in ALLOWED_TEXT_SCALE_PROFILES:
         fail(f"個別prompt: 未対応の text_scale_profile です: {text_scale_profile}")
     direction = str(item["special_direction"]).strip()
-    fv_expression = validate_fv_expression(item.get("fv_expression"), int(item["num"]))
+    fv_background_expression = background_plan.get("fv_background_expression")
+    if fv_background_expression == "あり":
+        level = str(item["background_expression_level"]).strip()
+        if level not in ALLOWED_BACKGROUND_EXPRESSION_LEVELS:
+            fail(f"個別prompt: 未対応の background_expression_level です: {level}")
+        background_expression_line = background_expression_prompt_line(level)
+    elif fv_background_expression == "なし":
+        background_expression_line = None
+    else:
+        decoration_level = str(item["decoration_level"]).strip()
+        if decoration_level not in ALLOWED_DECORATION_LEVELS:
+            fail(f"個別prompt: 未対応の decoration_level です: {decoration_level}")
+        background_expression_line = decoration_prompt_line(decoration_level, None)
+    section_positions = "・".join(str(section_start + offset) for offset in range(len(item["target_sections"])))
     lines = [
-        "$imagegen",
-        "",
-        *([*same_zone_edge_lines, ""] if same_zone_edge_lines else []),
         "## 生成対象",
         "",
-        f"- 目的: {item['section_purpose']}",
-        f"- 保存先: `{item['expected_output']}`",
-        "- 指定された文字サイズを優先し、内容・写真・あしらいが欠けなく収まる自然な高さを画像生成側で決める。",
-        f"- 背景ゾーン: `{item['background_zone']}` / `{palette_id}` / {palette_value} / {zone_treatment}",
-        "- 指定された単色またはグラデーションを画像全体のベース背景に使い、グラデーションは構成色と方向も維持する。",
-        f"- 出力: 横幅{REQUIRED_IMAGE_WIDTH}pxの高精細PNG",
+        f"横幅{REQUIRED_IMAGE_WIDTH}pxのWebデザインの1セクションの画像を制作。",
+        f"添付したFVと同じWebページの、FVより下の{section_positions}番目のセクションです。",
+        "添付FVの配色・書体・装飾の使い方を引き継ぐ。",
+        "FVの写真や構図は再利用しない。",
         "",
-        "## 文字サイズ（最優先）",
+        "## 背景カラー",
         "",
-        "- ここで指定するpxは、1440px幅のPC表示におけるCSS相当サイズとして扱い、出力PNGの画素数に合わせて倍化しない。",
-        "- 構図や余白を埋める判断より、この文字サイズを優先する。",
-        "- 日本語H2は35〜40px程度、本文は15px程度を共通基準にする。",
-        "- 下記の文字スケールプロファイルに役割別の指定がある場合は、共通の本文15px基準より優先する。",
-        f"- 文字スケールプロファイル: `{text_scale_profile}`。",
-        *TEXT_SCALE_PROMPT_LINES[text_scale_profile],
-        "- 通常のPC版Webサイトとして構成し、ポスターやプレゼン資料のような巨大文字にしない。",
-        "",
-        "## 共通デザイン",
-        "",
-        f"- `--image {selected_fv_image}` で添付された採用FVをスタイル参照として使う。",
-        "- 採用FVから全体で継承するのは、配色、書体の系統と太さ、角丸、線の太さ、基本UI、使用するアイコン・イラストの画風などの基礎トーン。",
-        "- 写真とイラストの構成も採用FVに合わせる。採用FVが写真とイラストの組み合わせなら、FV以下もページ全体として両方を使い、内容に合うセクションへ配分する。採用FVがイラストのみなら、明示指定がない限り写真を追加しない。",
-        "- 写真・イラストの構成の継承は、FVの写真枚数・並べ方・トリミングを繰り返す指定ではない。",
-        "- 写真を使う場合は、採用FVから色調、光、撮影品質だけを継承する。",
-        "- 人物写真を使う場合は、FV写真の人物と同じ顔を再現せず、異なる顔立ちの人物を使う。複数人を描く場合も、顔立ち・髪型・年齢感に自然な違いをつけ、似た顔の繰り返しを避ける。",
-        "- FVのレイアウト、FVのH1サイズ、FV固有の装飾モチーフを機械的にコピーしない。",
-        "- 文字、CTA、人物の顔などの主要部分を画面端で切らない。",
-        "- 1440px幅のPC表示換算で、見出し・本文・ボタンなどの情報要素は画面の左右端から最低120px離す。右寄せにも同じ基準を適用する。",
-        "- この最低余白を確保したうえで、配置や余白は内容に合わせて決め、全セクションを同じ配置・同じ余白に揃えない。写真・背景装飾は左右端まで広げてよい。",
-        "- 背景色、背景写真、意味を持たない背景装飾は左右端、および隣接mock-upと背景色が異なる上下端まで広げてよい。",
-        "- 同じ背景ゾーンの途中へ、区切り線、色差、グラデーションの切り替わりを追加しない。",
+        palette_value,
         "",
         "## 実装可能性",
         "",
-        "- 背景、写真・イラスト、文字、操作要素、装飾、反復項目の責任範囲を判別できる形にする。",
-        "- 1要素の移動、サイズ変更、文言変更、画像差し替えで、別要素を描き直す必要がある構造にしない。",
-        "- 反復要素は1つの共通ルールで再現し、個別に移動・追加・削除・並び替えできる形にする。",
-        "- 装飾は1要素内で完結させるか、コンテンツ位置に依存しない独立背景素材にする。",
-        "- PCからスマートフォンへの変更は、並び替え、積み重ね、縮小、独立装飾の非表示で説明できる形にし、線、マスク、切り抜き、装飾、合成画像の描き直しを必要としない。",
-        "- 複雑な写真やイラストは、文字や操作要素と分離できる明確な境界があれば、1つの独立画像素材として残してよい。",
-        "- 実装の都合だけで、すべてを均等カードや汎用グリッドにしない。",
+        f"- {item['implementation_direction']}",
+    ]
+    if content_surface_policy == DEFAULT_CONTENT_SURFACE_POLICY:
+        lines.append("- カードやパネルには紙・布・水彩の質感、破れた縁、不規則な輪郭を使わない。")
+    lines.extend([
         "",
         "## 見せ方",
         "",
-        f"- FVから使う特徴: {fv_expression}",
-        (
-            "- 記録されたFVの特徴を、このセクションの内容に合わせて取り入れる。FV全体の構図や特徴一式は再現せず、記録にない特徴を追加しない。"
-            if fv_expression != "なし"
-            else "- 共通スタイルのみ継承し、FV特有の写真の見せ方、写真枠、大きな線や図形、要素の重ね方は繰り返さない。写真や装飾は禁止せず、内容に合う独自の見せ方を考える。"
-        ),
-    ]
-    if normalize_text(direction) == "なし":
-        lines.append("- なし")
-    else:
-        lines.extend(f"- {line.strip()}" for line in direction.splitlines() if line.strip())
+        "- 狙い: " + " ".join(item["section_purpose"].split()),
+        spacing_prompt_line(background_plan.get("design_impression", "")),
+        "- タイトル文字は、画像の左右端からそれぞれ100px以上内側に収める。",
+        *TEXT_SCALE_PROMPT_LINES[text_scale_profile],
+        *(f"- {line.strip()}" for line in direction.splitlines() if line.strip()),
+        *([background_expression_line] if background_expression_line else []),
+    ])
+    if item.get("user_instruction"):
+        lines.append("- " + item["user_instruction"])
     if item["combine_sections_explicit"] == "yes":
-        lines.append("- 指定された2セクションを、この画像だけは1枚にまとめる。")
-    lines.extend(
-        [
-            "",
-            "## 表示文字",
-            "",
-            "コロンより左側は構造を伝える管理ラベルであり、画像には描かない。コロンより右側の値だけを表示する。見出しと本文など、同じ番号または同じ役割の組を対応づけて扱う。",
-            "",
-            "```text",
-            format_display_text_for_prompt(str(item["display_text_exact"])),
-            "```",
-            "",
-            "## 禁止事項",
-            "",
-            "- ヘッダー、ロゴ、ナビ、FV、mock-up番号、Section番号、Markdown記号、管理ラベルを描かない。",
-            "- 指定されていない説明文、コピー、固有名詞、数値を追加しない。",
-            "- 添付FV内の写真そのもの、切り抜き、ほぼ同一の再現を使用しない。",
-            "- FV写真と同一のポーズ、背景、構図を使用しない。",
-            "- HTML/CSSレンダリング、ブラウザ撮影、Canvas、SVG、手作業の画像合成を完成PNGの生成元にしない。",
-            "- 文字の正確さを理由にAI画像生成以外へ切り替えない。",
-        ]
-    )
-    if content_surface_policy == DEFAULT_CONTENT_SURFACE_POLICY:
-        lines.append(f"- {STANDARD_CONTENT_SURFACE_PROHIBITION}")
-    if forbids_photo(direction):
-        lines.append(
-            "- 簡易アートディレクションに写真なしが明示されているため、このmock-upでは写真を配置せず、添付FV内の写真も使用しない。"
-        )
-    if forbids_icons(direction):
-        lines.append("- このmock-upではアイコンを描かない。文字、罫線、余白で情報を整理する。")
-    lines.extend(
-        [
-            "",
-            "## 完了条件",
-            "",
-            f"- 完成PNGを横幅{REQUIRED_IMAGE_WIDTH}pxで指定保存先へ保存する。高さは生成結果に合わせ、幅補正時は縦横比を保つ。",
-            "- 文字、写真、あしらいを欠けなく配置する。",
-            "- この個別プロンプトは1回だけ実行し、生成結果を採用する。理由を問わず自動再生成しない。",
-            "- 生成または保存に失敗した場合は、別方式や同じプロンプトの再実行へ切り替えず停止する。",
-        ]
-    )
+        lines[2] = f"横幅{REQUIRED_IMAGE_WIDTH}pxのWebデザインの指定された2セクションを1枚の画像として制作。"
+    lines.extend(same_zone_edge_lines or [])
+    lines.extend([
+        "",
+        "## 表示文字",
+        "",
+        "コロンより左は管理ラベル。右側の文言だけを、記載順に表示する。",
+        "",
+        "```text",
+        format_display_text_for_prompt(str(item["display_text_exact"])),
+        "```",
+    ])
     return "\n".join(lines) + "\n"
 
 
 def build_batch_prompt(
     selected_fv_image: Path,
-    background_plan: dict,
     manifest: list[dict],
 ) -> str:
     lines = [
         "$imagegen",
         "",
         "生成方式（最優先・必須）:",
-        "- `prompts/individual/` の独立プロンプトを番号順に読み、各ファイルを1回の `$imagegen` 呼び出しへ1本ずつ渡す。",
+        "- `prompts/individual/` の個別promptを番号順に読み、各ファイルの全文を1回の `$imagegen` 呼び出しの `prompt` へ1本ずつ渡す。ファイルパスだけを渡さない。",
         f"- {len(manifest)}枚を1回の画像生成へまとめず、1画像につき1プロンプトで生成する。",
         "- 各完成PNGは、必ず `$imagegen` によるAI画像生成で作る。添付FVは全画像のスタイル参照として使う。",
         "- HTML/CSSレンダリング、Playwrightなどのブラウザ撮影、Canvas、SVG、手作業の画像合成を完成mock-upの生成元にしない。",
@@ -1182,33 +1191,18 @@ def build_batch_prompt(
         "個別プロンプトを画像生成内容の正本とし、このbatchは実行順とページ全体の連続性だけを管理する。",
         "",
         "入力画像:",
-        f"この子Codex実行には `--image {selected_fv_image}` で採用FV画像が添付されている。",
+        f"採用FV `{selected_fv_image}` を確認し、各画像生成呼び出しの `referenced_image_paths` に毎回渡す。パスをpromptに書くだけでは添付にならない。",
         "",
-        "ページ全体で守る3つの共通ルール:",
-        "1. 背景ゾーンの連続性: 同じ背景ゾーンのmock-upを1つの連続した背景面として扱い、背景を変えるのはゾーンが変わる時だけにする。",
-        "2. H2と本文の統一: 日本語H2は1440px表示換算で35〜40px程度、本文は15px程度を全mock-up共通の基準にする。数字、短い英語、背景用の飾り文字は、内容上必要な時だけ大きくしてよい。",
-        "3. FVの雰囲気継承: 配色・書体・角丸・線の太さ・基本UIなどの共通スタイルは全体で揃える。FV特有の表現は、工程05が決めた各個別promptの「FVから使う特徴」に従い、使用箇所や特徴を追加しない。写真のみ・イラストのみ・写真とイラストの組み合わせという構成はページ全体で受け継ぐが、写真枚数や並べ方は繰り返さない。写真は色調、光、撮影品質だけを継承し、FV写真そのもの、切り抜き、ほぼ同一の再現、同一のポーズ・背景・構図は使用しない。FVのレイアウト、H1サイズ、装飾モチーフを機械的にコピーしない。",
+        "個別prompt全文を変更せず渡す。このbatch・taskの説明をpromptへ追記しない。",
+        "",
+        "実行と記録:",
+        "- 工程05〜06の同じアプリ内担当が直接実行する。別CLIや画像生成専用の子担当は起動しない。",
+        "- manifestのprompt_sha256を個別ファイルと照合し、image_input_parametersを実際の参照画像引数へ渡す。FVを目視するだけでは添付済みにしない。",
+        "- 実際に返った画像をexpected_outputへ保存する。返却元を推測しない。横幅は1440pxへ等比補正し、内容を切り詰めない。",
+        "- generation-log.jsonlへタスク番号・promptパス・実参照画像引数・返却元・保存先・試行回数・結果を1呼び出し1行で追記する。呼び出しIDがあれば併記する。",
+        "- 実入力と保存PNGの読取を確認してから、reference-attachment-log.mdとmanifestの添付状態を更新する。失敗も記録し、未確認の成功状態を作らない。",
         "",
     ]
-    lines.extend(["背景計画（ページ共通）:", "背景パレット:"])
-    for palette in background_plan["palette"]:
-        lines.append(f"- {palette['id']}: {palette['value']}")
-    lines.append("背景ゾーン:")
-    for zone in background_plan["zones"]:
-        mockups = ", ".join(str(num) for num in zone["mockups"])
-        lines.append(
-            f"- {zone['id']}: {zone['palette_id']} / {zone['treatment']} / 対象mock-up {mockups}"
-        )
-    lines.extend(
-        [
-            "背景ゾーンルール:",
-            "- 同じゾーンの途中に、区切り線、色差、グラデーションの切り替わりを作らない。",
-            "- 背景を変更するのは、背景ゾーンが変わる境界だけにする。",
-            "- カード、UI、写真枠、CTAパネルの色は、ページ背景とは区別する。",
-            "- セクションが変わることだけを理由に背景色を変更しない。",
-            "",
-        ]
-    )
     lines.append("個別プロンプト実行順:")
     for item in manifest:
         lines.extend(
@@ -1228,7 +1222,7 @@ def build_batch_prompt(
             f"- {len(manifest)}本の個別プロンプトを番号順に1本ずつ実行し、{len(manifest)}枚すべてを指定の保存先へ保存する。",
             f"- 各PNGの横幅が{REQUIRED_IMAGE_WIDTH}pxか確認する。違う場合は可能な範囲で補正する。",
             "- 画像は原則1セクション1枚に分ける。2セクションを1枚にするのは、上で明示したmock-upだけにする。",
-            "- 画像内容に対する流体表現、文言、構成、セクション間統一の品質検査は行わない。",
+            "- 生成後は背景のつながりと原稿・雰囲気を確認し、気づいた差を報告する。自動でデザイン指示を増やさない。",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -1246,32 +1240,29 @@ def write_prompt_spec(
     quality: str,
     batch_prompt_file: Path,
     individual_prompt_dir: Path,
-    batch_child_run_log: Path,
-    batch_image_input_argument: str,
+    generation_log: Path,
+    image_input_parameters: dict,
     background_plan: dict,
     sections: list[dict],
 ) -> Path:
     """画像生成へ渡す前の構造化prompt正本を保存する。"""
     spec = {
-        "schema_version": 7,
+        "schema_version": 12,
         "page": page,
         "mode": mode,
         "source": str(input_md),
         "output_dir": str(out_dir),
         "style_ref": str(selected_fv_image),
-        "style_ref_scope": "共通スタイルは全体で継承し、FV特有の表現は各fv_expressionに従う。FV全体の構図や特徴一式は再現しない",
+        "style_ref_scope": STYLE_REF_SCOPE,
         "reference_image_sha256": selected_fv_sha256,
-        "generation_surface": "codex-cli-attached-image",
+        "generation_surface": "codex-app-imagegen",
         "page_flow": page_flow,
         "quality_hint": quality,
         "batch_prompt_file": str(batch_prompt_file),
         "individual_prompt_dir": str(individual_prompt_dir),
-        "child_run_log": str(batch_child_run_log),
-        "image_input_argument": batch_image_input_argument,
+        "generation_log": str(generation_log),
+        "image_input_parameters": image_input_parameters,
         "background_plan": background_plan,
-        "content_surface_policy": background_plan.get(
-            "content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY
-        ),
         "sections": sections,
     }
     prompt_spec_path = task_dir / "prompt-spec.json"
@@ -1305,40 +1296,45 @@ def write_imagegen_tasks(
 ) -> None:
     if quality != "high":
         fail("工程06の正式mock-up生成は --quality high だけを使用してください")
-    base = Path(project_dir)
+    base = Path(project_dir).resolve()
     input_md = Path(input_file) if input_file else base / "_src" / page / "section-prompts.md"
     out_dir = base / "mockups" / page
     task_dir = base / "_imagegen" / page
     prompt_dir = task_dir / "prompts"
     individual_prompt_dir = prompt_dir / "individual"
-    child_run_dir = task_dir / "child-runs"
+    existing_log = task_dir / "generation-log.jsonl"
+    if existing_log.exists() and existing_log.stat().st_size:
+        fail(f"生成記録があるため通常キューを上書きできません: {existing_log}\n既存画像を保持し、提示には --preview-only、修正には --revision を使ってください。")
     out_dir.mkdir(parents=True, exist_ok=True)
     task_dir.mkdir(parents=True, exist_ok=True)
     prompt_dir.mkdir(parents=True, exist_ok=True)
     individual_prompt_dir.mkdir(parents=True, exist_ok=True)
-    child_run_dir.mkdir(parents=True, exist_ok=True)
-    for stale_prompt in prompt_dir.glob("task-*.md"):
-        stale_prompt.unlink()
-    for stale_task in task_dir.glob("task-*.md"):
-        stale_task.unlink()
-    for stale_prompt in individual_prompt_dir.glob("*.md"):
-        stale_prompt.unlink()
-
     if not input_md.exists():
         fail(f"{input_md} が見つかりませんでした\n先にプロンプトファイルを保存してから再実行してください。")
 
     prompts = extract_prompts(input_md)
     if not prompts:
         fail(f"{input_md} に構造化プロンプトが見つかりませんでした")
+    if any("prompt_file" in item["meta"] for item in prompts):
+        fail("個別JSONからの再開は対応していません。工程05の計画からMarkdown用のsection-prompts.mdを作成してください。既存JSON・画像は変更しません。")
     background_plan = extract_background_plan(input_md)
     if background_plan is None:
         background_plan = legacy_background_plan(prompts)
     validate_background_plan(background_plan, prompts)
-    content_surface_policy = validate_content_surface_policy(
-        background_plan.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)
+    validate_prompt_meta(
+        prompts, base, page,
+        background_plan.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY),
+        background_plan.get("fv_background_expression"),
     )
-    background_plan["content_surface_policy"] = content_surface_policy
-    validate_prompt_meta(prompts, base, page, content_surface_policy)
+    if any(individual_prompt_dir.glob("*.json")):
+        fail("個別JSONが残っている作業フォルダは上書きしません。新規Markdown生成には別の作業フォルダを使ってください。")
+
+    for stale_prompt in prompt_dir.glob("task-*.md"):
+        stale_prompt.unlink()
+    for stale_task in task_dir.glob("task-*.md"):
+        stale_task.unlink()
+    for stale_prompt in individual_prompt_dir.glob("*.md"):
+        stale_prompt.unlink()
 
     selected_fv_image = extract_selected_fv_image(base)
     selected_fv_sha256 = sha256_file(selected_fv_image)
@@ -1348,56 +1344,19 @@ def write_imagegen_tasks(
     if chain:
         fail("batch.md標準ルートでは --chain は使えません。直前mock-up参照が必要な場合は修正モードで対応してください。")
     batch_prompt_file = prompt_dir / "batch.md"
-    batch_child_run_log = child_run_dir / "batch.log"
-    batch_image_input_argument = (
-        shell_join(
-            [
-                "codex",
-                "exec",
-                "--model",
-                "gpt-6-sol",
-                "--config",
-                'model_reasoning_effort="xhigh"',
-                "--cd",
-                str(base),
-                "--skip-git-repo-check",
-                "--sandbox",
-                "workspace-write",
-                "--add-dir",
-                str(base),
-                "--image",
-                str(selected_fv_image),
-                "-",
-            ]
-        )
-        + f" < {shlex.quote(str(batch_prompt_file))} > {shlex.quote(str(batch_child_run_log))} 2>&1"
-    )
+    generation_log = task_dir / "generation-log.jsonl"
+    image_input_parameters = {"referenced_image_paths": [str(selected_fv_image)]}
 
     manifest: list[dict] = []
     queue_lines = [
         f"# 画像生成タスク — {page}",
         "",
-        "このファイルはAPIを使わず、Codex上の画像生成へ渡すためのキューです。",
-        "通常モードでは `prompts/batch.md` を1つの子Codexへ渡し、子Codexが `prompts/individual/` の独立プロンプトを1本ずつ `$imagegen` へ渡します。",
+        "実行順の索引。手順はbatch、入力引数・hash・添付状態・保存先はmanifestを正本とする。",
         "",
-        f"- input: `{input_md}`",
-        f"- output_dir: `{out_dir}`",
-        f"- style_ref: `{selected_fv_image}`（全タスク）",
+        f"- manifest: `{task_dir / 'manifest.json'}`",
         f"- prompt_spec: `{task_dir / 'prompt-spec.json'}`",
-        "- generation_surface: `codex-cli-attached-image`",
-        "- child_model: `gpt-6-sol`",
-        "- child_reasoning_effort: `xhigh`",
-        "- style_ref_scope: 共通スタイルは全体で継承し、FV特有の表現は各fv_expressionに従う",
-        f"- reference_image_sha256: `{selected_fv_sha256}`",
-        f"- page_flow: {page_flow if page_flow else 'なし'}",
-        "- chain: なし（直前mock-up画像は参照しない）",
-        f"- quality_hint: `{quality}`",
-        "- code_friendly: yes",
-        f"- content_surface_policy: `{content_surface_policy}`",
         f"- batch_prompt_file: `{batch_prompt_file}`",
-        f"- individual_prompt_dir: `{individual_prompt_dir}`",
-        f"- child_run_log: `{batch_child_run_log}`",
-        f"- image_input_argument: `{batch_image_input_argument}`",
+        f"- generation_log: `{generation_log}`",
         "",
     ]
 
@@ -1423,29 +1382,41 @@ def write_imagegen_tasks(
                 "source_text_exact": meta["source_text_exact"],
                 "section_purpose": meta["section_purpose"],
                 "background_zone": meta["background_zone"],
-                "text_scale_profile": meta["text_scale_profile"],
                 "display_text_exact": meta["display_text_exact"],
-                "special_direction": meta["special_direction"],
-                "fv_expression": meta["fv_expression"],
-                "content_surface_policy": content_surface_policy,
+                "user_instruction": meta["user_instruction"],
+                **{key: meta[key] for key in (
+                    "text_scale_profile", "background_expression_level", "decoration_level",
+                    "special_direction", "implementation_direction",
+                ) if key in meta},
+                "prompt_format": "markdown",
                 "reference_image": None,
                 "style_ref": str(item_style_ref),
                 "reference_image_sha256": selected_fv_sha256,
-                "style_ref_scope": "共通スタイルは全体で継承し、FV特有の表現は各fv_expressionに従う。FV全体の構図や特徴一式は再現しない",
+                "style_ref_scope": STYLE_REF_SCOPE,
                 "style_ref_attachment_required": style_ref_attachment_required,
                 "style_ref_attachment_status": "pending" if style_ref_attachment_required else "not_required",
                 "actual_image_input": "pending",
                 "image_input_method": "actual_image_input_parameter",
-                "generation_surface": "codex-cli-attached-image",
+                "generation_surface": "codex-app-imagegen",
                 "required_image_width": REQUIRED_IMAGE_WIDTH,
-                "image_input_argument": batch_image_input_argument,
+                "image_input_parameters": image_input_parameters,
                 "batch_prompt_file": str(batch_prompt_file),
-                "child_run_log": str(batch_child_run_log),
-                "code_friendly": True,
+                "generation_log": str(generation_log),
                 "page_flow": page_flow,
                 "chain": chain,
             }
         )
+
+    serialized_prompts: dict[int, str] = {}
+    section_start = 1
+    for index, item in enumerate(manifest):
+        serialized = build_individual_prompt(
+            background_plan, item, same_zone_edge_prompt_lines(manifest, index, background_plan),
+            section_start=section_start,
+        )
+        section_start += len(item["target_sections"])
+        serialized_prompts[item["num"]] = serialized
+        item["prompt_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     prompt_spec_path = write_prompt_spec(
         task_dir=task_dir,
@@ -1459,81 +1430,37 @@ def write_imagegen_tasks(
         quality=quality,
         batch_prompt_file=batch_prompt_file,
         individual_prompt_dir=individual_prompt_dir,
-        batch_child_run_log=batch_child_run_log,
-        batch_image_input_argument=batch_image_input_argument,
+        generation_log=generation_log,
+        image_input_parameters=image_input_parameters,
         background_plan=background_plan,
         sections=manifest,
     )
     manifest = read_prompt_spec_sections(prompt_spec_path)
 
     batch_prompt_file.write_text(
-        build_batch_prompt(selected_fv_image, background_plan, manifest),
+        build_batch_prompt(selected_fv_image, manifest),
         encoding="utf-8",
     )
 
     for index, item in enumerate(manifest):
         task_file = Path(str(item["task_file"]))
         individual_prompt_file = Path(str(item["individual_prompt_file"]))
-        child_run_log = Path(str(item["child_run_log"]))
-        individual_prompt_file.write_text(
-            build_individual_prompt(
-                selected_fv_image,
-                background_plan,
-                item,
-                same_zone_edge_prompt_lines(manifest, index, background_plan),
-            ),
-            encoding="utf-8",
-        )
+        generation_log = Path(str(item["generation_log"]))
+        individual_prompt_file.write_text(serialized_prompts[item["num"]], encoding="utf-8")
+        if sha256_file(individual_prompt_file) != item["prompt_sha256"]:
+            fail(f"プロンプト{item['num']}: 保存したpromptのハッシュが一致しません")
         task_file.write_text(
             "\n".join(
                 [
                     f"# タスク{int(item['num'])}：{item['title']}",
                     "",
-                    f"- expected_output: `{item['expected_output']}`",
+                    f"- manifest: `{task_dir / 'manifest.json'}` / num: {item['num']}",
                     f"- individual_prompt_file: `{individual_prompt_file}`",
-                    f"- prompt_spec: `{prompt_spec_path}`",
-                    "- target_sections:",
-                    *[f"  - {section}" for section in item["target_sections"]],
-                    f"- combine_sections_explicit: {item['combine_sections_explicit']}",
-                    f"- section_purpose: `{item['section_purpose']}`",
-                    f"- background_zone: `{item['background_zone']}`",
-                    f"- special_direction: `{item['special_direction']}`",
-                    f"- fv_expression: `{item['fv_expression']}`",
-                    f"- content_surface_policy: `{item['content_surface_policy']}`",
-                    "- reference_image: なし",
-                    f"- style_ref: `{item['style_ref']}`",
-                    "- style_ref_attachment_required: yes",
-                    "- style_ref_attachment_status: pending",
-                    "- actual_image_input: pending",
-                    "- image_input_method: actual_image_input_parameter",
-                    "- generation_surface: codex-cli-attached-image",
-                    f"- required_image_width: {REQUIRED_IMAGE_WIDTH}px",
-                    f"- image_input_argument: `{item['image_input_argument']}`",
+                    f"- expected_output: `{item['expected_output']}`",
                     f"- batch_prompt_file: `{batch_prompt_file}`",
-                    f"- child_run_log: `{child_run_log}`",
-                    f"- reference_image_sha256: `{selected_fv_sha256}`",
-                    "- code_friendly: yes",
                     "",
-                    "## 表示する文字",
-                    "",
-                    "```text",
-                    str(item["display_text_exact"]),
-                    "```",
-                    "",
-                    "## 参照画像添付チェック",
-                    "",
-                    "- 標準では `image_input_argument` の一括 `codex exec --image` で採用FV画像を子Codexへ添付する。",
-                    "- `view_image_only`、`prompt_mentions_reference`、`直前に表示した画像`、prompt内パスだけでは実画像入力済みにしない。",
-                    "- Codex CLIの画像添付が使えない場合、通常生成を実行しない。",
-                    "- 生成後、`_imagegen/top/reference-attachment-log.md` に実画像入力証跡を記録する。",
-                    "- `child_run_log` と `output_file` が実在し、0バイトでない場合だけ `status: passed` にする。",
-                    "",
-                    "## 出力チェック",
-                    "",
-                    f"- 保存したPNGの横幅は必ず{REQUIRED_IMAGE_WIDTH}pxにする。",
-                    f"- 横幅が{REQUIRED_IMAGE_WIDTH}pxでない場合は、プレビュー作成前にスクリプトが自動補正する。ただし生成タスク内でも保存直後に確認する。",
-                    "- 高さは生成結果に合わせ、幅補正時は縦横比を保つ。重要な文字・写真・あしらいを切らない。",
-                    "- 画像内容に対する流体表現、文言、構成、セクション間統一の品質検査は行わない。",
+                    "参照画像引数・hash・状態はmanifestの該当項目を確認し、batchの手順で実行する。",
+                    "表示文言は個別promptに保持し、この索引へ転記しない。",
                     "",
                 ]
             ),
@@ -1544,25 +1471,8 @@ def write_imagegen_tasks(
                 f"## {int(item['num'])}. {item['title']}",
                 "",
                 f"- task_file: `{task_file}`",
-                f"- expected_output: `{item['expected_output']}`",
                 f"- individual_prompt_file: `{individual_prompt_file}`",
-                f"- prompt_spec: `{prompt_spec_path}`",
-                "- target_sections: " + " / ".join(item["target_sections"]),
-                f"- combine_sections_explicit: {item['combine_sections_explicit']}",
-                f"- section_purpose: `{item['section_purpose']}`",
-                f"- background_zone: `{item['background_zone']}`",
-                f"- special_direction: `{item['special_direction']}`",
-                f"- fv_expression: `{item['fv_expression']}`",
-                "- reference_image: なし",
-                f"- style_ref: `{item['style_ref']}`",
-                "- style_ref_attachment_required: yes",
-                "- style_ref_attachment_status: pending",
-                "- generation_surface: `codex-cli-attached-image`",
-                f"- image_input_argument: `{item['image_input_argument']}`",
-                f"- batch_prompt_file: `{batch_prompt_file}`",
-                f"- child_run_log: `{child_run_log}`",
-                f"- reference_image_sha256: `{selected_fv_sha256}`",
-                "- code_friendly: yes",
+                f"- expected_output: `{item['expected_output']}`",
                 "",
             ]
         )
@@ -1575,20 +1485,20 @@ def write_imagegen_tasks(
     log_lines = [
         "# セクション参照画像添付ログ",
         "",
-        "| task | target_sections | reference_image_path | reference_image_sha256 | actual_image_input | image_input_method | generation_surface | image_input_argument | individual_prompt_file | batch_prompt_file | child_run_log | output_file | status |",
+        "| task | target_sections | reference_image_path | reference_image_sha256 | actual_image_input | image_input_method | generation_surface | image_input_parameters | individual_prompt_file | batch_prompt_file | generation_log | output_file | status |",
         "|:--|:--|:--|:--|:--|:--|:--|:--|:--|:--|:--|:--|:--|",
     ]
     for item in manifest:
         log_lines.append(
-            "| {task} | {target_sections} | `{reference_image_path}` | `{reference_image_sha256}` | pending | actual_image_input_parameter | codex-cli-attached-image | `{image_input_argument}` | `{individual_prompt_file}` | `{batch_prompt_file}` | `{child_run_log}` | `{output_file}` | pending |".format(
+            "| {task} | {target_sections} | `{reference_image_path}` | `{reference_image_sha256}` | pending | actual_image_input_parameter | codex-app-imagegen | `{image_input_parameters}` | `{individual_prompt_file}` | `{batch_prompt_file}` | `{generation_log}` | `{output_file}` | pending |".format(
                 task=f"task-{int(item['num']):02d}",
                 target_sections=" / ".join(item["target_sections"]),
                 reference_image_path=item["style_ref"],
                 reference_image_sha256=item["reference_image_sha256"],
-                image_input_argument=item["image_input_argument"],
+                image_input_parameters=json.dumps(item["image_input_parameters"], ensure_ascii=False),
                 individual_prompt_file=item["individual_prompt_file"],
                 batch_prompt_file=item["batch_prompt_file"],
-                child_run_log=item["child_run_log"],
+                generation_log=item["generation_log"],
                 output_file=item["expected_output"],
             )
         )
@@ -1598,17 +1508,17 @@ def write_imagegen_tasks(
             "## 実画像入力証跡として望ましい状態",
             "- `actual_image_input: yes`",
             "- `image_input_method: actual_image_input_parameter`",
-            "- `generation_surface: codex-cli-attached-image`",
-            "- `image_input_argument` に `codex exec`、`--image`、採用FV画像パス、`prompts/batch.md` が含まれる",
-            "- `individual_prompt_file`、`batch_prompt_file`、`child_run_log`、`output_file` が実在し、0バイトではない",
+            "- `generation_surface: codex-app-imagegen`",
+            "- 各呼び出しの `image_input_parameters.referenced_image_paths` に採用FVの絶対パスが含まれる",
+            "- `individual_prompt_file`、`batch_prompt_file`、`generation_log`、`output_file` が実在し、0バイトではない",
             "",
             "## Issues に記録する状態",
             "- `view_image_only`",
             "- `prompt_mentions_reference`",
             "- `直前に表示した画像`",
-            "- `image_input_argument` に `--image` がない",
-            "- `image_input_argument` に `prompts/batch.md` がない",
-            "- `child_run_log` 欠落",
+            "- 実際の画像生成呼び出しに `referenced_image_paths` がない",
+            "- 参照画像引数に採用FVが含まれない",
+            "- `generation_log` 欠落",
             "",
             "上記の Issues があっても、画像が生成済みで、0バイト・破損・真っ白などの明確な生成失敗でなければ、提示を止めない。",
         ]
@@ -1620,9 +1530,9 @@ def write_imagegen_tasks(
     print(f"   prompt spec: {prompt_spec_path}")
     print(f"   batch実行指示: {batch_prompt_file}")
     print(f"   個別プロンプト: {individual_prompt_dir}")
-    print(f"   子実行ログ: {batch_child_run_log}")
+    print(f"   画像生成ログ: {generation_log}")
     print(f"   保存先: {out_dir}")
-    print("   次は image_input_argument の codex exec --image でbatch.mdを1つの子Codexへ渡し、individualの各promptを1本ずつ生成してください。")
+    print("   次はアプリ内の同じ担当がbatch.mdを読み、各個別prompt全文を無変更で、image_input_parametersを実画像入力として画像生成ツールへ1本ずつ渡してください。")
 
     print("   mock-up画像を保存後、--preview-only で full_preview.html を作成してください。")
     if open_output:
@@ -1662,6 +1572,14 @@ def generate_full_preview_html(project_dir: Path, page: str) -> Path:
     preview_items: list[Path] = [extract_selected_fv_image(project_dir)]
     preview_items.extend(images)
     for image in preview_items:
+        try:
+            with Image.open(image) as source:
+                if source.format != "PNG":
+                    fail(f"PNG画像ではありません: {image}")
+                source.load()
+        except (OSError, ValueError) as exc:
+            fail(f"画像として読み取れません: {image}: {exc}")
+    for image in images:
         normalize_png_width(image)
 
     imgs_html = "\n".join(
@@ -1676,8 +1594,8 @@ def generate_full_preview_html(project_dir: Path, page: str) -> Path:
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ background: #e8e8e8; }}
-.wrap {{ display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 24px 0; }}
-img {{ width: 100%; max-width: 1440px; display: block; box-shadow: 0 2px 12px rgba(0,0,0,.12); }}
+.wrap {{ display: flex; flex-direction: column; width: 100%; max-width: 1440px; margin: 24px auto; gap: 0; }}
+img {{ width: 100%; height: auto; display: block; }}
 </style>
 </head>
 <body>
