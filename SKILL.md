@@ -25,9 +25,9 @@ description: MCP認証付きのAIデザインSkill。webデザイン、AIデザ�
 
 更新のためにローカル変更の削除、強制reset、別リポジトリへの接続変更を行わない。
 
-### 2026.10.01.1 の設定移行
+### 2026.10.02.1 の設定移行
 
-更新後、Codexが使用中の`config.toml`にある`[mcp_servers.web-design-pro.http_headers]`の`X-Client-Version`を確認する。旧版なら、ほかの設定と契約者トークンを保持したまま`2026.10.01.1`へ更新する。設定変更後はCodexの再起動を案内し、再開後に契約確認へ進む。設定を変更できない場合は理由を報告し、旧版のヘッダーのまま新版の接続確認を完了扱いにしない。
+更新後、Codexが使用中の`config.toml`にある`[mcp_servers.web-design-pro.http_headers]`の`X-Client-Version`を確認する。旧版なら、ほかの設定と契約者トークンを保持したまま`2026.10.02.1`へ更新する。設定変更後はCodexの再起動を案内し、再開後に契約確認へ進む。設定を変更できない場合は理由を報告し、旧版のヘッダーのまま新版の接続確認を完了扱いにしない。
 
 ## 起動
 
@@ -43,7 +43,7 @@ description: MCP認証付きのAIデザインSkill。webデザイン、AIデザ�
 
 - 工程手順が読むよう指定した補助資料だけを`web_design_read_support`で取得する。一括取得しない。
 - 参考画像が必要な場合だけ`web_design_read_image`で開く。
-- 手順中の`<THIS_SKILL_DIR>/scripts`は、このスキルの`runtime/<skill-id>/scripts`へ読み替える。
+- 手順中の`<THIS_SKILL_DIR>/scripts`と`<SKILL_DIR>/scripts`は、このスキルの`runtime/<skill-id>/scripts`へ読み替える。
 - 手順中の`../../_shared/`は、このスキルの`runtime/_shared/`へ読み替える。
 - 配布された実行スクリプトは利用者の案件ファイルに対してローカルで実行する。秘密手順本文を案件フォルダへ保存しない。
 

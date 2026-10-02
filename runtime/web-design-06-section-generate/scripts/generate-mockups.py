@@ -37,7 +37,7 @@ REQUIRED_PROMPT_META_KEYS = {
 }
 OPTIONAL_PROMPT_META_KEYS = {
     "combine_sections_explicit", "text_scale_profile", "user_instruction",
-    "background_expression_level", "decoration_level",
+    "background_expression_level", "decoration_level", "image_shape",
 }
 LEGACY_PROMPT_META_KEYS = {"background", "top_background", "bottom_background", "height_type", "target_ratio"}
 ALLOWED_PROMPT_META_KEYS = (
@@ -69,8 +69,8 @@ DECORATION_PROMPT_LINES = {
 ALLOWED_BACKGROUND_EXPRESSION_LEVELS = {"なし", "少し", "しっかり"}
 BACKGROUND_EXPRESSION_PROMPT_LINES = {
     "なし": "- 背景演出量: なし。指定された背景面だけを使い、背景図形・線・光・模様を追加しない。",
-    "少し": "- 背景演出量: 少し。FVと同系統の背景表現を控えめに使い、文字と内容の読みやすさを保つ。",
-    "しっかり": "- 背景演出量: しっかり。FVと同系統の背景表現を強めに使い、文字と内容の読みやすさを保つ。",
+    "少し": "- 背景演出量: 少し。内容に合う背景表現を控えめに使い、文字と内容の読みやすさを保つ。",
+    "しっかり": "- 背景演出量: しっかり。内容に合う背景表現を強めに使い、文字と内容の読みやすさを保つ。",
 }
 TEXT_SCALE_PROMPT_LINES = {
     "default-web": (),
@@ -125,9 +125,9 @@ NO_PHOTO_DIRECTION_PHRASES = (
 
 ALLOWED_PAGE_COMMON_META_KEYS = {
     "style", "background_palette", "background_zones", "content_surface_policy", "design_impression",
-    "fv_background_expression",
+    "fv_background_expression", "fv_image_shape",
 }
-STYLE_REF_SCOPE = "採用FVの配色・書体・写真品質・UI・イラストの雰囲気。写真そのものやFVの構図は繰り返さない。"
+STYLE_REF_SCOPE = "採用FVの配色・書体の雰囲気・写真やイラストの色調と質感・ボタンのデザイン。特殊な画像の外形の使用・不使用は、個別の画像の形に記録した方針に従う。"
 
 
 def validate_content_surface_policy(value: object) -> str:
@@ -505,6 +505,15 @@ def validate_background_id(value: str, label: str) -> str:
     return value
 
 
+def validate_image_shape_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value.strip().lower() in {"なし", "none"} or value.strip().isdigit():
+        fail(f"{label}: 特殊な画像の形は短い非空文字列で記録し、通常は項目を省略してください")
+    value = " ".join(value.split())
+    if len(value) > 160 or re.search(r"```|\d+(?:\.\d+)?\s*px|\b(?:x|y)\s*=|\d+\s*カラム|左右比率", value, re.I):
+        fail(f"{label}: 160文字以内とし、詳細座標やサイズを指定しないでください")
+    return value
+
+
 def validate_style(value: object) -> str:
     """旧計画の観察記録を保持する。個別promptには出さない。"""
     if value is None:
@@ -541,6 +550,7 @@ def extract_background_plan(input_md: Path) -> dict | None:
             "ページ共通計画: 許可されていないYAMLメタがあります: "
             + ", ".join(unknown)
         )
+    fv_image_shape = validate_image_shape_text(meta["fv_image_shape"], "ページ共通計画: fv_image_shape") if "fv_image_shape" in meta else None
     palette_entries = meta.get("background_palette")
     zone_entries = meta.get("background_zones")
     if not isinstance(palette_entries, list) or not palette_entries:
@@ -602,6 +612,7 @@ def extract_background_plan(input_md: Path) -> dict | None:
         "design_impression": impression.strip(),
         "content_surface_policy": validate_content_surface_policy(meta.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY)),
         **({"fv_background_expression": fv_background_expression} if fv_background_expression is not None else {}),
+        **({"fv_image_shape": fv_image_shape} if fv_image_shape is not None else {}),
     }
 
 
@@ -721,6 +732,7 @@ def validate_prompt_meta(
     page: str,
     content_surface_policy: str = DEFAULT_CONTENT_SURFACE_POLICY,
     fv_background_expression: str | None = None,
+    fv_image_shape: str | None = None,
 ) -> None:
     texts_path = project_dir / "texts.md"
     if not texts_path.exists():
@@ -795,6 +807,12 @@ def validate_prompt_meta(
             if decoration not in ALLOWED_DECORATION_LEVELS:
                 fail(f"プロンプト{num}: 旧計画の decoration_level が不正です: {decoration}")
             meta["decoration_level"] = decoration
+        if "image_shape" in meta:
+            if fv_image_shape is None:
+                fail(f"プロンプト{num}: image_shape にはページ共通計画の fv_image_shape が必要です")
+            meta["image_shape"] = validate_image_shape_text(meta["image_shape"], f"プロンプト{num}: image_shape")
+            validate_content_surface_compatibility(meta["image_shape"], content_surface_policy, num, "image_shape")
+            validate_implementation_independence(meta["image_shape"], num, "image_shape")
         meta["special_direction"] = validate_special_direction(meta["special_direction"], num)
         validate_content_surface_compatibility(meta["special_direction"], content_surface_policy, num)
         validate_implementation_independence(meta["special_direction"], num)
@@ -1129,8 +1147,8 @@ def build_individual_prompt(
         "",
         f"横幅{REQUIRED_IMAGE_WIDTH}pxのWebデザインの1セクションの画像を制作。",
         f"添付したFVと同じWebページの、FVより下の{section_positions}番目のセクションです。",
-        "添付FVの配色・書体・装飾の使い方を引き継ぐ。",
-        "FVの写真や構図は再利用しない。",
+        "添付FVは、配色・書体の雰囲気・写真やイラストの色調と質感・ボタンのデザインを参考にする。",
+        "各セクションの構成とビジュアルの見せ方は、以下の内容・目的に合わせて設計する。",
         "",
         "## 背景カラー",
         "",
@@ -1151,6 +1169,7 @@ def build_individual_prompt(
         "- タイトル文字は、画像の左右端からそれぞれ100px以上内側に収める。",
         *TEXT_SCALE_PROMPT_LINES[text_scale_profile],
         *(f"- {line.strip()}" for line in direction.splitlines() if line.strip()),
+        *([f"- 画像の形: {item['image_shape']}"] if background_plan.get("fv_image_shape") and item.get("image_shape") else []),
         *([background_expression_line] if background_expression_line else []),
     ])
     if item.get("user_instruction"):
@@ -1197,9 +1216,10 @@ def build_batch_prompt(
         "",
         "実行と記録:",
         "- 工程05〜06の同じアプリ内担当が直接実行する。別CLIや画像生成専用の子担当は起動しない。",
+        "- 各呼び出し直前にワークフローの配置判断を行い、prepare-layout.pyで保存する。FVをページの1枚目として数え、直前2枚の実画像が左テキストで、次が2カラムに適する場合だけ未実行promptを右テキストへ更新する。明示指定を優先する。",
         "- manifestのprompt_sha256を個別ファイルと照合し、image_input_parametersを実際の参照画像引数へ渡す。FVを目視するだけでは添付済みにしない。",
         "- 実際に返った画像をexpected_outputへ保存する。返却元を推測しない。横幅は1440pxへ等比補正し、内容を切り詰めない。",
-        "- generation-log.jsonlへタスク番号・promptパス・実参照画像引数・返却元・保存先・試行回数・結果を1呼び出し1行で追記する。呼び出しIDがあれば併記する。",
+        "- generation-log.jsonlへタスク番号（task_num）・promptパス・実参照画像引数・返却元・保存先・試行回数・結果を1呼び出し1行で追記する。呼び出しIDがあれば併記する。",
         "- 実入力と保存PNGの読取を確認してから、reference-attachment-log.mdとmanifestの添付状態を更新する。失敗も記録し、未確認の成功状態を作らない。",
         "",
     ]
@@ -1222,7 +1242,7 @@ def build_batch_prompt(
             f"- {len(manifest)}本の個別プロンプトを番号順に1本ずつ実行し、{len(manifest)}枚すべてを指定の保存先へ保存する。",
             f"- 各PNGの横幅が{REQUIRED_IMAGE_WIDTH}pxか確認する。違う場合は可能な範囲で補正する。",
             "- 画像は原則1セクション1枚に分ける。2セクションを1枚にするのは、上で明示したmock-upだけにする。",
-            "- 生成後は背景のつながりと原稿・雰囲気を確認し、気づいた差を報告する。自動でデザイン指示を増やさない。",
+            "- 生成後は背景のつながりと原稿・雰囲気を確認し、気づいた差を報告する。生成済みpromptへ指示を追加せず、自動再生成しない。",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -1325,6 +1345,7 @@ def write_imagegen_tasks(
         prompts, base, page,
         background_plan.get("content_surface_policy", DEFAULT_CONTENT_SURFACE_POLICY),
         background_plan.get("fv_background_expression"),
+        background_plan.get("fv_image_shape"),
     )
     if any(individual_prompt_dir.glob("*.json")):
         fail("個別JSONが残っている作業フォルダは上書きしません。新規Markdown生成には別の作業フォルダを使ってください。")
@@ -1386,7 +1407,7 @@ def write_imagegen_tasks(
                 "user_instruction": meta["user_instruction"],
                 **{key: meta[key] for key in (
                     "text_scale_profile", "background_expression_level", "decoration_level",
-                    "special_direction", "implementation_direction",
+                    "special_direction", "implementation_direction", "image_shape",
                 ) if key in meta},
                 "prompt_format": "markdown",
                 "reference_image": None,
