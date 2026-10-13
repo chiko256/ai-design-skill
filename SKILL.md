@@ -68,16 +68,6 @@ description: MCP認証付きのAIデザインSkill。webデザイン、AIデザ�
 - 手順中の`../../_shared/`は、このスキルの`runtime/_shared/`へ読み替える。
 - 配布された実行スクリプトは利用者の案件ファイルに対してローカルで実行する。秘密手順本文を案件フォルダへ保存しない。
 
-## Figma Design Bridgeの場所
-
-Figma Design Bridgeを使う工程へ入る前に、この接続用Skillの実ファイル位置を基準に `node <このSkillの実体>/scripts/figma-bridge.mjs locate` を実行する。カレントディレクトリや利用者名から場所を推測しない。返された`pluginRoot`を`FIGMA_BRIDGE_ROOT`として扱い、工程担当にも値を引き継ぐ。
-
-MCP手順中の`<FIGMA_BRIDGE_ROOT>`は、この解決済みの本体フォルダーへ読み替える。`AGENT_USAGE.md`を必ず読み、初回設定が必要なら`CODEX_SETUP.md`も読む。プラグイン登録・起動の前に同じスクリプトの`prepare`を実行し、返された`manifest`を使う。これはGit管理外の`.runtime/plugin`に作るローカル実行用コピーで、Git同梱元のmanifestやSkillを直接変更しない。Figma発行IDが必要な場合もローカルコピーだけへ設定し、次回prepareではそのIDを保持する。共通本体はこのSkillに同梱された`runtime/figma-design-bridge`で、Skillやmanifestに利用者別の絶対パスを書き込まない。
-
-起動は `node <このSkillの実体>/scripts/figma-bridge.mjs start --json`、接続コード発行は`pair`、接続確認は`status`。対象ファイルの起動・接続はCodexが行い、接続後の制作はCLIを使う。実際に必要なログイン・OS権限確認以外を「接続できたら教えてください」という質問へ置き換えない。
-
-同梱本体が無い場合は既存の安全なGit更新を再確認する。ローカル変更の強制上書きや、知らない場所からの本体取得は行わない。見つからなければ更新できなかった理由を報告し、その工程は開始しない。既存のFigma MCPを指定する他工程の方式は、この配置追加だけでは変更しない。
-
 ## 工程06の画像生成
 
 工程05〜06の同じアプリ内担当が、同梱スクリプトのキューに従って個別promptを1本ずつ画像生成ツールへ渡す。採用FVを確認し、各呼び出しの `referenced_image_paths` に実画像の絶対パスを指定する。画像生成専用の子担当や別CLIは起動しない。MCP手順に旧CLI方式の指定が残る場合も、この呼び出し方式を使う。
