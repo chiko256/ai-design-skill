@@ -1,0 +1,17 @@
+.runtime/
+node_modules/
+.DS_Store
+
+# Local credentials and signing keys must never be committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+connection.json
+
+# Customer-specific samples and device-test records stay on this Mac.
+examples/
+TEST_REPORT.md

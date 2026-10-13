@@ -1,0 +1,29 @@
+{
+  "name": "figma-design-bridge",
+  "version": "0.1.5",
+  "sourceCommit": "273d2eda9069c2b7616e58055554fd2516d08a1d",
+  "files": {
+    ".gitignore": "230d36e2ee66bb4dab74c0cc128321cd3cbf3382404b9c8e4e9fc0dc9fac6a20",
+    ".gitattributes": "e0f8cbad0a312ae91139bc203c65f2b0109fda55139314f382c0a2d1a95aac04",
+    "package.json": "4b68024f4381532b6a40d841326fce1ecb8141805bca43c966882f964237f1c1",
+    "README.md": "0642100e71a40e5ce8798f51f8c65e6ec489e018a3b79c6901eb133f2ea40830",
+    "START_HERE.md": "89d501ed171a1311248973c644ccb82b67d70b7ff345261b73b62cba3ca9ee37",
+    "CODEX_SETUP.md": "f346dbbbab33762b497f9e2ec6f3458028bd0df1add738c499b6c4d1cef4f958",
+    "AGENT_USAGE.md": "17586bad6cb4b3f7e02dc95ce977713d8a8c033b4206decd5785a334d8cd77e9",
+    "PROTOCOL.md": "86cf63649bcee0a1879e68e1167119f39bb1df7c8553d7c403f56f95b6bc7165",
+    "STAGE10_WORKFLOW.md": "c54cd769e18492287982853f895fc677244710fba7bc831b4a2312101b456467",
+    "Start Bridge.command": "fd815b11226e55ecf2f3ed734f799a093d5f0fd974198259828ed78076d4c6f9",
+    "Start Bridge.cmd": "c48c0809284a2fc787d56ec519084e2aed9a3531c05a4a3f7904eb68030a019f",
+    "bridge/cli.mjs": "84ccd2cfff4899c8a73f906234d4e5b0d7706b8548fb619c72bb3dd6411f2537",
+    "bridge/server.mjs": "9a25e61417ddd0f811170129703f5d002d65120c280c699184ae1283ed7ac9cc",
+    "bridge/start.mjs": "35ad9dfc4861efe32f230776fcfb9f35fe47580f59ba4fa155a062dafba3a586",
+    "bridge/workflow.mjs": "01eaa4277ae58e3a7748039fbf3daa5477243f4dfb351c95cd59031a1af54ca8",
+    "plugin/code.js": "95b990b1ddb4c53946eafdbd90a22f50ff7d15e9dab98893274a60bd8d8a6531",
+    "plugin/ui.html": "b490b255457adb11012873d3d767f2d9225613196b8958a505851e421ccc9a9d",
+    "plugin/manifest.json": "a8d8a9e702bb8d97d9aa952782005e7cee7abcfd194167fc2108838bdeb0b23c",
+    "tests/bridge.test.mjs": "30619b9580c5121b8de9553239f89795fbe793a786ba911904820d607bc4146f",
+    "tests/engine.test.mjs": "b4224aa31e4d6460b15aec04ba01d49bf4f9dd02721b628a432ab39ab4cd2f9e",
+    "tests/start.test.mjs": "d7d84124ab59cb7cad8cc2300e9a750b1432381c0db332e67125607b8dfb1b29",
+    "tests/ui.test.mjs": "68f0b60c607db9c8d0f084419e56bdad8da627257f7d7aed46ba26ec5e22ed48"
+  }
+}

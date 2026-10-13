@@ -1,0 +1,14 @@
+{
+  "name": "figma-design-bridge",
+  "version": "0.1.5",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bridge/server.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check plugin/code.js && node --check bridge/server.mjs && node --check bridge/cli.mjs && node --check bridge/start.mjs && node --check bridge/workflow.mjs"
+  }
+}

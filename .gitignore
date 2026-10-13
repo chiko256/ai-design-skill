@@ -14,3 +14,6 @@ data/
 *.key
 *secret*
 *token*
+
+# Local Figma connection state is never part of customer updates.
+**/.runtime/
