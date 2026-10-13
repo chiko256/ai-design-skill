@@ -7,12 +7,12 @@ import { spawnSync } from 'node:child_process';
 export function locateBridge(clientRoot = fileURLToPath(new URL('../', import.meta.url))) {
   const root = fs.realpathSync(path.join(clientRoot,'runtime','figma-design-bridge'));
   const release = JSON.parse(fs.readFileSync(path.join(root,'RELEASE.json'),'utf8'));
-  if(release.name!=='figma-design-bridge'||!/^[a-f0-9]{40}$/.test(release.sourceCommit)||!release.files||typeof release.files!=='object')throw Error('Invalid Bridge release');
+  if(release.name!=='figma-design-bridge'||!/^[a-f0-9]{40}$/.test(release.sourceCommit)||release.hashNormalization!=='utf8-lf'||!release.files||typeof release.files!=='object')throw Error('Invalid Bridge release');
   for(const [name,hash] of Object.entries(release.files)) {
     if(!name||name.includes('\\')||name.includes(':')||name.startsWith('/')||name.split('/').includes('..'))throw Error('Invalid Bridge release path');
     const file=fs.realpathSync(path.join(root,name));
     if(!file.startsWith(root+path.sep)||!fs.statSync(file).isFile())throw Error('Bridge file escaped its root');
-    if(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')!==hash)throw Error('Bridge was edited; preserve local changes before updating: '+name);
+    if(crypto.createHash('sha256').update(fs.readFileSync(file,'utf8').replace(/\r\n/g,'\n')).digest('hex')!==hash)throw Error('Bridge was edited; preserve local changes before updating: '+name);
   }
   for(const required of ['AGENT_USAGE.md','CODEX_SETUP.md','PROTOCOL.md','package.json','plugin/manifest.json','bridge/start.mjs','bridge/cli.mjs'])
     if(!Object.hasOwn(release.files,required))throw Error('Bridge release is incomplete: '+required);

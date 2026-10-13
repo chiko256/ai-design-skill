@@ -1,7 +1,8 @@
 {
   "name": "figma-design-bridge",
   "version": "0.1.5",
-  "sourceCommit": "273d2eda9069c2b7616e58055554fd2516d08a1d",
+  "sourceCommit": "a7d0cc06bbb8505b78b389d0b67065ac602f37c0",
+  "hashNormalization": "utf8-lf",
   "files": {
     ".gitignore": "230d36e2ee66bb4dab74c0cc128321cd3cbf3382404b9c8e4e9fc0dc9fac6a20",
     ".gitattributes": "e0f8cbad0a312ae91139bc203c65f2b0109fda55139314f382c0a2d1a95aac04",
@@ -13,7 +14,7 @@
     "PROTOCOL.md": "86cf63649bcee0a1879e68e1167119f39bb1df7c8553d7c403f56f95b6bc7165",
     "STAGE10_WORKFLOW.md": "c54cd769e18492287982853f895fc677244710fba7bc831b4a2312101b456467",
     "Start Bridge.command": "fd815b11226e55ecf2f3ed734f799a093d5f0fd974198259828ed78076d4c6f9",
-    "Start Bridge.cmd": "c48c0809284a2fc787d56ec519084e2aed9a3531c05a4a3f7904eb68030a019f",
+    "Start Bridge.cmd": "c76b4eed06c6fdcd975ff307c95ba9c1338d56e044d8ac689a247cb01643430b",
     "bridge/cli.mjs": "84ccd2cfff4899c8a73f906234d4e5b0d7706b8548fb619c72bb3dd6411f2537",
     "bridge/server.mjs": "9a25e61417ddd0f811170129703f5d002d65120c280c699184ae1283ed7ac9cc",
     "bridge/start.mjs": "35ad9dfc4861efe32f230776fcfb9f35fe47580f59ba4fa155a062dafba3a586",
